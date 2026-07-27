@@ -118,6 +118,12 @@ h1{font-size:1.4rem;text-align:center;padding:12px 0 4px;color:#2ee8b7}
 .cbtn.rst{background:#1a1a2e;color:#c0392b;border:1px solid #c0392b}
 .cbtn.rst:active{background:#2c1015}
 .hide{display:none!important}
+.rrow{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.rrow:last-child{margin-bottom:0}
+.rrow span{font-size:.82rem;color:#aaa}
+.rrow button{padding:6px 18px;border:none;border-radius:6px;font-size:.78rem;font-weight:600;cursor:pointer;min-width:56px;transition:.2s}
+.ron{background:#2ee8b7;color:#111}
+.roff{background:#333;color:#666}
 .msg{text-align:center;font-size:.8rem;color:#f39c12;padding:8px;opacity:0;transition:opacity .3s}
 .msg.show{opacity:1}
 .info{text-align:center;font-size:.7rem;color:#555;margin-top:8px}
@@ -140,6 +146,14 @@ h1{font-size:1.4rem;text-align:center;padding:12px 0 4px;color:#2ee8b7}
 <button onclick="setMode(6)">Под<br>светка</button>
 <button onclick="setMode(7)">Бегущие<br>огни</button>
 <button onclick="setMode(8)">Анали<br>затор</button>
+</div>
+
+<div class="sec">
+<h2>Реле</h2>
+<div class="rrow"><span>Реле 1</span><button id="r1" onclick="tR(1)">OFF</button></div>
+<div class="rrow"><span>Реле 2</span><button id="r2" onclick="tR(2)">OFF</button></div>
+<div class="rrow"><span>Реле 3</span><button id="r3" onclick="tR(3)">OFF</button></div>
+<div class="rrow"><span>Реле 4</span><button id="r4" onclick="tR(4)">OFF</button></div>
 </div>
 
 <div class="sec">
@@ -250,6 +264,10 @@ function togglePower(){
   var n=S.on?0:1;
   fetch('/set?on='+n).then(function(){load()}).catch(function(){});
 }
+function tR(n){
+  var v=S['r'+n]?0:1;
+  fetch('/set?r'+n+'='+v).then(function(){load()}).catch(function(){});
+}
 function setFSM(v){
   fetch('/set?fsm='+v).then(function(){load()}).catch(function(){});
 }
@@ -267,7 +285,7 @@ function calibrate(){
 }
 function resetDefaults(){
   if(!confirm('Сбросить все настройки?'))return;
-  fetch('/set?on=1&mode=0&br=200&ebr=30&ecol=192&sm=0.5&smf=0.8&rs=5&mcf=1.5&mc=1.8&exp=1.4&rs2=0.5&sp=140&ss=200&lc=0&ls=255&cs=100&rp=1&rns=11&hs=0&hst=5&fsm=0&lm=0')
+  fetch('/set?on=1&mode=0&br=200&ebr=30&ecol=192&sm=0.5&smf=0.8&rs=5&mcf=1.5&mc=1.8&exp=1.4&rs2=0.5&sp=140&ss=200&lc=0&ls=255&cs=100&rp=1&rns=11&hs=0&hst=5&fsm=0&lm=0&r1=0&r2=0&r3=0&r4=0')
   .then(function(){showMsg('Сброшено');load()}).catch(function(){});
 }
 function showMsg(t){
@@ -306,6 +324,7 @@ function load(){
     for(var i=0;i<fb.length;i++)fb[i].className=i==d.fsm?'act':'';
     var lb=$('lm_btns').children;
     for(var i=0;i<lb.length;i++)lb[i].className=i==d.lm?'act':'';
+    for(var i=1;i<=4;i++){var rb=$('r'+i);if(d['r'+i]){rb.textContent='ON';rb.className='ron'}else{rb.textContent='OFF';rb.className='roff'}}
     showSections(d.mode,d.lm);
     $('ipinfo').textContent='IP: '+d.ip+(d.ap?' (точка доступа)':' (домашняя сеть)');
   }).catch(function(){});

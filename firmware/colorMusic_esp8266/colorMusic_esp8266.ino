@@ -13,6 +13,14 @@
 #define LED_PIN     3     // RX = GPIO3, I2S DMA — аппаратный вывод через NeoPixelBus
 #define BTN_PIN     13    // D7 = GPIO13, кнопка (--- GND)
 
+// ----- реле -----
+#define RELAY1_PIN  5     // D1 = GPIO5
+#define RELAY2_PIN  4     // D2 = GPIO4
+#define RELAY3_PIN  14    // D5 = GPIO14
+#define RELAY4_PIN  12    // D6 = GPIO12
+#define RELAY_ON    LOW   // большинство модулей реле — active LOW
+#define RELAY_OFF   HIGH
+
 // ----- настройки ленты -----
 #define NUM_LEDS        100   // количество светодиодов
 #define PSU_CURRENT_MA  500   // ток блока питания в мА (менять под свой БП)
@@ -74,7 +82,7 @@
 
 // ========================= СТРУКТУРА НАСТРОЕК =========================
 
-#define SETTINGS_MARKER 0xCF
+#define SETTINGS_MARKER 0xD0
 
 struct Settings {
   uint8_t marker;
@@ -105,6 +113,7 @@ struct Settings {
   uint16_t spektr_low_pass;
   char wifi_ssid[33];
   char wifi_pass[65];
+  bool relay[4];
 };
 
 Settings cfg;
@@ -184,9 +193,16 @@ void setup() {
   // --- LED лента (NeoPixelBus I2S DMA на GPIO3 / RX) ---
   strip.Begin();
   strip.Show();
-  FastLED.addLeds<WS2812B, 14, GRB>(leds, NUM_LEDS);
+  FastLED.addLeds<WS2812B, 2, GRB>(leds, NUM_LEDS);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, PSU_CURRENT_MA);
   FastLED.setBrightness(DEFAULT_BRIGHTNESS);
+
+  // --- Реле (выключить до загрузки настроек) ---
+  const uint8_t rPins[] = {RELAY1_PIN, RELAY2_PIN, RELAY3_PIN, RELAY4_PIN};
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(rPins[i], RELAY_OFF);
+    pinMode(rPins[i], OUTPUT);
+  }
 
   // --- Кнопка ---
   butt1.setTimeout(900);
@@ -197,6 +213,7 @@ void setup() {
 
   // --- Применить загруженные настройки ---
   applySettings();
+  for (int i = 0; i < 4; i++) applyRelay(i);
 
   // --- WiFi ---
   if (cfg.wifi_ssid[0] != '\0') {
@@ -269,6 +286,12 @@ void setDefaults() {
   cfg.spektr_low_pass = DEFAULT_SPEKTR_LOW_PASS;
   cfg.wifi_ssid[0] = '\0';
   cfg.wifi_pass[0] = '\0';
+  for (int i = 0; i < 4; i++) cfg.relay[i] = false;
+}
+
+void applyRelay(int i) {
+  const uint8_t rPins[] = {RELAY1_PIN, RELAY2_PIN, RELAY3_PIN, RELAY4_PIN};
+  digitalWrite(rPins[i], cfg.relay[i] ? RELAY_ON : RELAY_OFF);
 }
 
 void loadSettings() {
@@ -778,6 +801,9 @@ void handleGet() {
   json += ",\"lm\":" + String(light_mode);
   json += ",\"lp\":" + String(cfg.low_pass);
   json += ",\"slp\":" + String(cfg.spektr_low_pass);
+  for (int i = 0; i < 4; i++) {
+    json += ",\"r" + String(i + 1) + "\":" + String(cfg.relay[i] ? 1 : 0);
+  }
   json += ",\"ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"";
   json += ",\"ap\":" + String(isAPMode ? 1 : 0);
   json += "}";
@@ -893,6 +919,15 @@ void handleSet() {
   if (server.hasArg("slp")) {
     cfg.spektr_low_pass = server.arg("slp").toInt();
     changed = true;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    String key = "r" + String(i + 1);
+    if (server.hasArg(key)) {
+      cfg.relay[i] = server.arg(key).toInt();
+      applyRelay(i);
+      changed = true;
+    }
   }
 
   if (changed) markChanged();
