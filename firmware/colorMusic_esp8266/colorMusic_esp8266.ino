@@ -1,7 +1,7 @@
 /*
   Светомузыка на NodeMCU (ESP8266)
   Порт проекта AlexGyver ColorMusic v2.10
-  Управление через веб-интерфейс (WiFi точка доступа)
+  Управление через удалённый сервер (WebSocket)
 
   Оригинал: https://github.com/AlexGyver/ColorMusic
 */
@@ -10,7 +10,7 @@
 
 // ----- пины подключения (NodeMCU) -----
 #define SOUND_PIN   A0    // аналоговый вход аудио (единственный на ESP8266)
-#define LED_PIN     3     // RX = GPIO3, I2S DMA — аппаратный вывод через NeoPixelBus
+#define LED_PIN     2     // D4 = GPIO2, UART1 TX — аппаратный вывод через NeoPixelBus
 #define BTN_PIN     13    // D7 = GPIO13, кнопка (--- GND)
 
 // ----- реле -----
@@ -25,14 +25,14 @@
 #define NUM_LEDS        100   // количество светодиодов
 #define PSU_CURRENT_MA  500   // ток блока питания в мА (менять под свой БП)
 
-// ----- WiFi точка доступа -----
+// ----- WiFi точка доступа (режим настройки) -----
 #define AP_SSID     "ColorMusic"
-#define AP_PASS     "12345678"    // минимум 8 символов
+#define AP_PASS     "12345678"
 
 // ----- настройки по умолчанию -----
 #define DEFAULT_BRIGHTNESS    200
 #define DEFAULT_EMPTY_BRIGHT  30
-#define DEFAULT_EMPTY_COLOR   192   // HUE_PURPLE
+#define DEFAULT_EMPTY_COLOR   192
 #define DEFAULT_SMOOTH        0.5
 #define DEFAULT_SMOOTH_FREQ   0.8
 #define DEFAULT_RAINBOW_STEP  5.0
@@ -52,16 +52,18 @@
 #define DEFAULT_SPEKTR_LOW_PASS 40
 #define DEFAULT_EXP           1.4
 #define DEFAULT_MAX_COEF      1.8
+#define DEFAULT_WS_HOST       "0.0.0.0"
+#define DEFAULT_WS_PORT       3000
 
 // ----- отрисовка -----
-#define MAIN_LOOP     16    // период основного цикла (мс), ~60 FPS
-#define SMOOTH_STEP   20    // скорость затухания цветомузыки
-#define LIGHT_SMOOTH  2     // скорость затухания анализатора
+#define MAIN_LOOP     16
+#define SMOOTH_STEP   20
+#define LIGHT_SMOOTH  2
 #define LOW_PASS_ADD  13
 #define LOW_PASS_FREQ_ADD 3
-#define LOW_COLOR     0     // красный
-#define MID_COLOR     96    // зелёный
-#define HIGH_COLOR    42    // жёлтый
+#define LOW_COLOR     0
+#define MID_COLOR     96
+#define HIGH_COLOR    42
 #define STROBE_COLOR  42
 #define MODE_AMOUNT   9
 
@@ -71,6 +73,8 @@
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
 
 #define FASTLED_ESP8266_RAW_PIN_ORDER
 #include "FastLED.h"
@@ -82,7 +86,7 @@
 
 // ========================= СТРУКТУРА НАСТРОЕК =========================
 
-#define SETTINGS_MARKER 0xD0
+#define SETTINGS_MARKER 0xD2
 
 struct Settings {
   uint8_t marker;
@@ -114,6 +118,8 @@ struct Settings {
   char wifi_ssid[33];
   char wifi_pass[65];
   bool relay[4];
+  char ws_host[65];
+  uint16_t ws_port;
 };
 
 Settings cfg;
@@ -121,10 +127,11 @@ Settings cfg;
 // ========================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =========================
 
 CRGB leds[NUM_LEDS];
-NeoPixelBus<NeoGrbFeature, NeoEsp8266DmaWs2812xMethod> strip(NUM_LEDS);
+NeoPixelBus<NeoGrbFeature, NeoEsp8266AsyncUart1Ws2812xMethod> strip(NUM_LEDS);
 
-ESP8266WebServer server(80);
+ESP8266WebServer httpServer(80);
 DNSServer dnsServer;
+WebSocketsClient wsClient;
 GButton butt1(BTN_PIN);
 
 int fft_input[FFT_SIZE];
@@ -150,7 +157,7 @@ float averageLevel = 50;
 int maxLevel = 100;
 int MAX_CH = NUM_LEDS / 2;
 int hue;
-unsigned long main_timer, hue_timer, strobe_timer, running_timer, color_timer, rainbow_timer, eeprom_timer, save_timer;
+unsigned long main_timer, hue_timer, strobe_timer, running_timer, color_timer, rainbow_timer, eeprom_timer, save_timer, state_timer;
 float averK = 0.006;
 byte count;
 float index_coef;
@@ -171,6 +178,8 @@ int this_color;
 boolean running_flag[3];
 bool settings_changed = false;
 bool isAPMode = false;
+bool wsConnected = false;
+String deviceId;
 
 void showStrip() {
   uint8_t bri = calculate_max_brightness_for_power_vmA(leds, NUM_LEDS, FastLED.getBrightness(), 5, PSU_CURRENT_MA);
@@ -187,37 +196,35 @@ void showStrip() {
 // ========================= SETUP =========================
 
 void setup() {
+  delay(3000);
+
   Serial.begin(115200);
   Serial.println("\n=== ColorMusic ESP8266 ===");
 
-  // --- LED лента (NeoPixelBus I2S DMA на GPIO3 / RX) ---
-  strip.Begin();
-  strip.Show();
-  FastLED.addLeds<WS2812B, 2, GRB>(leds, NUM_LEDS);
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, PSU_CURRENT_MA);
-  FastLED.setBrightness(DEFAULT_BRIGHTNESS);
+  deviceId = "colormusic-" + String(ESP.getChipId(), HEX);
+  Serial.println("Device ID: " + deviceId);
 
-  // --- Реле (выключить до загрузки настроек) ---
   const uint8_t rPins[] = {RELAY1_PIN, RELAY2_PIN, RELAY3_PIN, RELAY4_PIN};
   for (int i = 0; i < 4; i++) {
     digitalWrite(rPins[i], RELAY_OFF);
     pinMode(rPins[i], OUTPUT);
   }
 
-  // --- Кнопка ---
   butt1.setTimeout(900);
 
-  // --- EEPROM ---
   EEPROM.begin(512);
   loadSettings();
-
-  // --- Применить загруженные настройки ---
   applySettings();
   for (int i = 0; i < 4; i++) applyRelay(i);
 
-  // --- WiFi ---
+  WiFi.forceSleepWake();
+  delay(200);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+
   if (cfg.wifi_ssid[0] != '\0') {
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
     Serial.printf("Connecting to %s", cfg.wifi_ssid);
     unsigned long startAttempt = millis();
@@ -232,6 +239,13 @@ void setup() {
     isAPMode = false;
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
     Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+    if (cfg.ws_host[0] != '\0' && strcmp(cfg.ws_host, "0.0.0.0") != 0) {
+      wsClient.begin(cfg.ws_host, cfg.ws_port, "/ws/device");
+      wsClient.onEvent(wsEvent);
+      wsClient.setReconnectInterval(5000);
+      Serial.printf("WS connecting to %s:%d\n", cfg.ws_host, cfg.ws_port);
+    }
   } else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
@@ -240,19 +254,170 @@ void setup() {
     Serial.printf("AP mode: %s / %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
   }
 
-  setupWebServer();
+  setupAPServer();
+
+  strip.Begin();
+  strip.Show();
+  FastLED.addLeds<WS2812B, 16, GRB>(leds, NUM_LEDS);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, PSU_CURRENT_MA);
+  FastLED.setBrightness(cfg.brightness);
+
   Serial.println("Ready!");
 }
 
 // ========================= LOOP =========================
 
 void loop() {
-  if (isAPMode) dnsServer.processNextRequest();
-  server.handleClient();
+  if (isAPMode) {
+    dnsServer.processNextRequest();
+  } else {
+    wsClient.loop();
+    stateTick();
+  }
+  httpServer.handleClient();
   buttonTick();
   mainLoop();
   eepromTick();
   yield();
+}
+
+// ========================= WEBSOCKET =========================
+
+void wsEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      wsConnected = true;
+      Serial.println("WS connected");
+      sendHello();
+      break;
+    case WStype_DISCONNECTED:
+      wsConnected = false;
+      Serial.println("WS disconnected");
+      break;
+    case WStype_TEXT:
+      handleWsMessage(payload, length);
+      break;
+    case WStype_PING:
+    case WStype_PONG:
+      break;
+  }
+}
+
+void handleWsMessage(uint8_t * payload, size_t length) {
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, payload, length)) return;
+
+  const char* type = doc["type"];
+  if (!type) return;
+
+  if (strcmp(type, "set") == 0) {
+    JsonObject params = doc["params"];
+    if (params.isNull()) return;
+    bool changed = false;
+    for (JsonPair p : params) {
+      changed |= applyParam(p.key().c_str(), p.value());
+    }
+    if (changed) markChanged();
+    sendState();
+  }
+
+  if (strcmp(type, "get") == 0) {
+    sendState();
+  }
+
+  if (strcmp(type, "calibrate") == 0) {
+    fullLowPass();
+    String msg = "{\"type\":\"calibrate\",\"result\":{\"lp\":" + String(cfg.low_pass) + ",\"slp\":" + String(cfg.spektr_low_pass) + "}}";
+    wsClient.sendTXT(msg);
+  }
+}
+
+bool applyParam(const char* key, JsonVariant val) {
+  if (strcmp(key, "on") == 0) { ONstate = val.as<int>(); cfg.on_state = ONstate; if (!ONstate) { fill_solid(leds, NUM_LEDS, CRGB::Black); showStrip(); } return true; }
+  if (strcmp(key, "mode") == 0) { this_mode = val.as<int>(); cfg.this_mode = this_mode; return true; }
+  if (strcmp(key, "br") == 0) { cfg.brightness = val.as<int>(); FastLED.setBrightness(cfg.brightness); return true; }
+  if (strcmp(key, "ebr") == 0) { cfg.empty_bright = val.as<int>(); return true; }
+  if (strcmp(key, "ecol") == 0) { cfg.empty_color = val.as<int>(); return true; }
+  if (strcmp(key, "sm") == 0) { cfg.smooth = val.as<float>(); return true; }
+  if (strcmp(key, "smf") == 0) { cfg.smooth_freq = val.as<float>(); return true; }
+  if (strcmp(key, "rs") == 0) { cfg.rainbow_step = val.as<float>(); return true; }
+  if (strcmp(key, "mcf") == 0) { cfg.max_coef_freq = val.as<float>(); return true; }
+  if (strcmp(key, "mc") == 0) { cfg.max_coef = val.as<float>(); return true; }
+  if (strcmp(key, "exp") == 0) { cfg.exp_val = val.as<float>(); return true; }
+  if (strcmp(key, "rs2") == 0) { cfg.rainbow_step_2 = val.as<float>(); return true; }
+  if (strcmp(key, "sp") == 0) { cfg.strobe_period = val.as<int>(); light_time = cfg.strobe_period * DEFAULT_STROBE_DUTY / 100; return true; }
+  if (strcmp(key, "ss") == 0) { cfg.strobe_smooth = val.as<int>(); return true; }
+  if (strcmp(key, "lc") == 0) { cfg.light_color = val.as<int>(); return true; }
+  if (strcmp(key, "ls") == 0) { cfg.light_sat = val.as<int>(); return true; }
+  if (strcmp(key, "cs") == 0) { cfg.color_speed = val.as<int>(); return true; }
+  if (strcmp(key, "rp") == 0) { cfg.rainbow_period = val.as<int>(); return true; }
+  if (strcmp(key, "rns") == 0) { cfg.running_speed = val.as<int>(); return true; }
+  if (strcmp(key, "hs") == 0) { cfg.hue_start = val.as<int>(); return true; }
+  if (strcmp(key, "hst") == 0) { cfg.hue_step = val.as<int>(); return true; }
+  if (strcmp(key, "fsm") == 0) { freq_strobe_mode = val.as<int>(); cfg.freq_strobe_mode = freq_strobe_mode; return true; }
+  if (strcmp(key, "lm") == 0) { light_mode = val.as<int>(); cfg.light_mode = light_mode; return true; }
+  if (strcmp(key, "lp") == 0) { cfg.low_pass = val.as<int>(); return true; }
+  if (strcmp(key, "slp") == 0) { cfg.spektr_low_pass = val.as<int>(); return true; }
+
+  for (int i = 0; i < 4; i++) {
+    char rkey[3];
+    snprintf(rkey, sizeof(rkey), "r%d", i + 1);
+    if (strcmp(key, rkey) == 0) { cfg.relay[i] = val.as<int>(); applyRelay(i); return true; }
+  }
+  return false;
+}
+
+String buildStateJson() {
+  String json = "{";
+  json += "\"on\":" + String(ONstate ? 1 : 0);
+  json += ",\"mode\":" + String(this_mode);
+  json += ",\"br\":" + String(cfg.brightness);
+  json += ",\"ebr\":" + String(cfg.empty_bright);
+  json += ",\"ecol\":" + String(cfg.empty_color);
+  json += ",\"sm\":" + String(cfg.smooth, 2);
+  json += ",\"smf\":" + String(cfg.smooth_freq, 2);
+  json += ",\"rs\":" + String(cfg.rainbow_step, 1);
+  json += ",\"mcf\":" + String(cfg.max_coef_freq, 1);
+  json += ",\"mc\":" + String(cfg.max_coef, 1);
+  json += ",\"exp\":" + String(cfg.exp_val, 1);
+  json += ",\"rs2\":" + String(cfg.rainbow_step_2, 1);
+  json += ",\"sp\":" + String(cfg.strobe_period);
+  json += ",\"ss\":" + String(cfg.strobe_smooth);
+  json += ",\"lc\":" + String(cfg.light_color);
+  json += ",\"ls\":" + String(cfg.light_sat);
+  json += ",\"cs\":" + String(cfg.color_speed);
+  json += ",\"rp\":" + String(cfg.rainbow_period);
+  json += ",\"rns\":" + String(cfg.running_speed);
+  json += ",\"hs\":" + String(cfg.hue_start);
+  json += ",\"hst\":" + String(cfg.hue_step);
+  json += ",\"fsm\":" + String(freq_strobe_mode);
+  json += ",\"lm\":" + String(light_mode);
+  json += ",\"lp\":" + String(cfg.low_pass);
+  json += ",\"slp\":" + String(cfg.spektr_low_pass);
+  for (int i = 0; i < 4; i++) {
+    json += ",\"r" + String(i + 1) + "\":" + String(cfg.relay[i] ? 1 : 0);
+  }
+  json += "}";
+  return json;
+}
+
+void sendHello() {
+  String msg = "{\"type\":\"hello\",\"deviceId\":\"" + deviceId + "\",\"name\":\"ColorMusic\",\"state\":" + buildStateJson() + "}";
+  wsClient.sendTXT(msg);
+}
+
+void sendState() {
+  if (!wsConnected) return;
+  String msg = "{\"type\":\"state\",\"state\":" + buildStateJson() + "}";
+  wsClient.sendTXT(msg);
+}
+
+void stateTick() {
+  if (!wsConnected) return;
+  if (millis() - state_timer > 5000) {
+    state_timer = millis();
+    sendState();
+  }
 }
 
 // ========================= НАСТРОЙКИ: ЗАГРУЗКА/СОХРАНЕНИЕ =========================
@@ -284,9 +449,11 @@ void setDefaults() {
   cfg.hue_step = DEFAULT_HUE_STEP;
   cfg.low_pass = DEFAULT_LOW_PASS;
   cfg.spektr_low_pass = DEFAULT_SPEKTR_LOW_PASS;
-  cfg.wifi_ssid[0] = '\0';
-  cfg.wifi_pass[0] = '\0';
+  strncpy(cfg.wifi_ssid, "Blanik", sizeof(cfg.wifi_ssid));
+  strncpy(cfg.wifi_pass, "61746723D", sizeof(cfg.wifi_pass));
   for (int i = 0; i < 4; i++) cfg.relay[i] = false;
+  strncpy(cfg.ws_host, DEFAULT_WS_HOST, sizeof(cfg.ws_host));
+  cfg.ws_port = DEFAULT_WS_PORT;
 }
 
 void applyRelay(int i) {
@@ -346,15 +513,19 @@ void buttonTick() {
     if (++cfg.this_mode >= MODE_AMOUNT) cfg.this_mode = 0;
     this_mode = cfg.this_mode;
     markChanged();
+    sendState();
   }
   if (butt1.isDouble()) {
     cfg.wifi_ssid[0] = '\0';
     cfg.wifi_pass[0] = '\0';
+    cfg.ws_host[0] = '\0';
     saveSettings();
     ESP.restart();
   }
   if (butt1.isHolded()) {
     fullLowPass();
+    String msg = "{\"type\":\"calibrate\",\"result\":{\"lp\":" + String(cfg.low_pass) + ",\"slp\":" + String(cfg.spektr_low_pass) + "}}";
+    if (wsConnected) wsClient.sendTXT(msg);
   }
 }
 
@@ -378,7 +549,6 @@ void analyzeAudio() {
 }
 
 void autoLowPass() {
-  // калибровка порога шумов для VU
   delay(10);
   int thisMax = 0;
   int thisLevel;
@@ -389,7 +559,6 @@ void autoLowPass() {
   }
   cfg.low_pass = thisMax + LOW_PASS_ADD;
 
-  // калибровка порога для спектра
   thisMax = 0;
   for (int i = 0; i < 100; i++) {
     analyzeAudio();
@@ -416,7 +585,6 @@ void mainLoop() {
   RsoundLevel = 0;
   LsoundLevel = 0;
 
-  // --- режимы VU (0, 1) ---
   if (this_mode == 0 || this_mode == 1) {
     for (byte i = 0; i < 100; i++) {
       RcurrentLevel = analogRead(SOUND_PIN);
@@ -428,7 +596,7 @@ void mainLoop() {
     RsoundLevel = pow(RsoundLevel, cfg.exp_val);
 
     RsoundLevel_f = RsoundLevel * cfg.smooth + RsoundLevel_f * (1 - cfg.smooth);
-    LsoundLevel_f = RsoundLevel_f;  // моно
+    LsoundLevel_f = RsoundLevel_f;
 
     if (cfg.empty_bright > 5) {
       for (int i = 0; i < NUM_LEDS; i++)
@@ -439,14 +607,13 @@ void mainLoop() {
       averageLevel = (float)(RsoundLevel_f + LsoundLevel_f) / 2 * averK + averageLevel * (1 - averK);
       maxLevel = (float)averageLevel * cfg.max_coef;
       Rlenght = map(RsoundLevel_f, 0, maxLevel, 0, MAX_CH);
-      Llenght = Rlenght;  // моно
+      Llenght = Rlenght;
       Rlenght = constrain(Rlenght, 0, MAX_CH);
       Llenght = constrain(Llenght, 0, MAX_CH);
       animation();
     }
   }
 
-  // --- режимы цветомузыки (2, 3, 4, 7, 8) ---
   if (this_mode == 2 || this_mode == 3 || this_mode == 4 || this_mode == 7 || this_mode == 8) {
     analyzeAudio();
     colorMusic[0] = 0;
@@ -457,15 +624,12 @@ void mainLoop() {
       if (fft_output[i] < cfg.spektr_low_pass) fft_output[i] = 0;
     }
 
-    // низкие частоты: бины 2-5
     for (byte i = 2; i < 6; i++) {
       if (fft_output[i] > colorMusic[0]) colorMusic[0] = fft_output[i];
     }
-    // средние частоты: бины 6-10
     for (byte i = 6; i < 11; i++) {
       if (fft_output[i] > colorMusic[1]) colorMusic[1] = fft_output[i];
     }
-    // высокие частоты: бины 11-31
     for (byte i = 11; i < 32; i++) {
       if (fft_output[i] > colorMusic[2]) colorMusic[2] = fft_output[i];
     }
@@ -499,7 +663,6 @@ void mainLoop() {
     animation();
   }
 
-  // --- режим стробоскопа (5) ---
   if (this_mode == 5) {
     if ((long)millis() - strobe_timer > cfg.strobe_period) {
       strobe_timer = millis();
@@ -526,7 +689,6 @@ void mainLoop() {
     animation();
   }
 
-  // --- режим подсветки (6) ---
   if (this_mode == 6) animation();
 
   showStrip();
@@ -538,7 +700,6 @@ void mainLoop() {
 void animation() {
   switch (this_mode) {
 
-    // --- VU-метр с палитрой ---
     case 0:
       count = 0;
       for (int i = (MAX_CH - 1); i > ((MAX_CH - 1) - Rlenght); i--) {
@@ -557,7 +718,6 @@ void animation() {
       }
       break;
 
-    // --- VU-метр с радугой ---
     case 1:
       if (millis() - rainbow_timer > 30) {
         rainbow_timer = millis();
@@ -580,7 +740,6 @@ void animation() {
       }
       break;
 
-    // --- Цветомузыка: 5 полос ---
     case 2:
       for (int i = 0; i < NUM_LEDS; i++) {
         if (i < STRIPE)          leds[i] = CHSV(HIGH_COLOR, 255, thisBright[2]);
@@ -591,7 +750,6 @@ void animation() {
       }
       break;
 
-    // --- Цветомузыка: 3 полосы ---
     case 3:
       for (int i = 0; i < NUM_LEDS; i++) {
         if (i < NUM_LEDS / 3)          leds[i] = CHSV(HIGH_COLOR, 255, thisBright[2]);
@@ -600,7 +758,6 @@ void animation() {
       }
       break;
 
-    // --- Цветомузыка: вспышки ---
     case 4:
       switch (freq_strobe_mode) {
         case 0:
@@ -615,7 +772,6 @@ void animation() {
       }
       break;
 
-    // --- Стробоскоп ---
     case 5:
       if (strobe_bright > 0)
         for (int i = 0; i < NUM_LEDS; i++) leds[i] = CHSV(STROBE_COLOR, 0, strobe_bright);
@@ -623,7 +779,6 @@ void animation() {
         for (int i = 0; i < NUM_LEDS; i++) leds[i] = CHSV(cfg.empty_color, 255, cfg.empty_bright);
       break;
 
-    // --- Подсветка ---
     case 6:
       switch (light_mode) {
         case 0:
@@ -654,7 +809,6 @@ void animation() {
       }
       break;
 
-    // --- Бегущие огни ---
     case 7:
       switch (freq_strobe_mode) {
         case 0:
@@ -683,7 +837,6 @@ void animation() {
       }
       break;
 
-    // --- Анализатор спектра ---
     case 8: {
       byte HUEindex = cfg.hue_start;
       for (int i = 0; i < NUM_LEDS / 2; i++) {
@@ -704,34 +857,16 @@ void MIDS()    { for (int i = 0; i < NUM_LEDS; i++) leds[i] = CHSV(MID_COLOR, 25
 void LOWS()    { for (int i = 0; i < NUM_LEDS; i++) leds[i] = CHSV(LOW_COLOR, 255, thisBright[0]); }
 void SILENCE() { for (int i = 0; i < NUM_LEDS; i++) leds[i] = CHSV(cfg.empty_color, 255, cfg.empty_bright); }
 
-// ========================= ВЕБ-СЕРВЕР =========================
+// ========================= AP-MODE ВЕБ-СЕРВЕР (только настройка WiFi/сервера) =========================
 
-void setupWebServer() {
-  server.on("/get", HTTP_GET, handleGet);
-  server.on("/set", HTTP_GET, handleSet);
-  server.on("/calibrate", HTTP_GET, handleCalibrate);
-  server.on("/wifi", HTTP_GET, handleWifiPage);
-  server.on("/scan", HTTP_GET, handleWifiScan);
-  server.on("/wifisave", HTTP_GET, handleWifiSave);
-  server.on("/wifireset", HTTP_GET, handleWifiReset);
-  if (isAPMode) {
-    server.on("/", HTTP_GET, handleWifiPage);
-    server.on("/ctrl", HTTP_GET, handleRoot);
-    server.onNotFound(handleWifiPage);
-  } else {
-    server.on("/", HTTP_GET, handleRoot);
-    server.onNotFound(handleRoot);
-  }
-  server.begin();
-  Serial.println("Web server started");
-}
-
-void handleRoot() {
-  server.send_P(200, "text/html", WEB_PAGE);
-}
-
-void handleWifiPage() {
-  server.send_P(200, "text/html", WIFI_PAGE);
+void setupAPServer() {
+  httpServer.on("/", HTTP_GET, []() { httpServer.send_P(200, "text/html", WIFI_PAGE); });
+  httpServer.on("/scan", HTTP_GET, handleWifiScan);
+  httpServer.on("/wifisave", HTTP_GET, handleWifiSave);
+  httpServer.on("/wifireset", HTTP_GET, handleWifiReset);
+  httpServer.onNotFound([]() { httpServer.send_P(200, "text/html", WIFI_PAGE); });
+  httpServer.begin();
+  Serial.println("Config server started");
 }
 
 void handleWifiScan() {
@@ -746,196 +881,35 @@ void handleWifiScan() {
   }
   json += "]";
   WiFi.scanDelete();
-  server.send(200, "application/json", json);
+  httpServer.send(200, "application/json", json);
 }
 
 void handleWifiSave() {
-  if (server.hasArg("ssid")) {
-    server.arg("ssid").toCharArray(cfg.wifi_ssid, 33);
-    if (server.hasArg("pass"))
-      server.arg("pass").toCharArray(cfg.wifi_pass, 65);
+  if (httpServer.hasArg("ssid")) {
+    httpServer.arg("ssid").toCharArray(cfg.wifi_ssid, 33);
+    if (httpServer.hasArg("pass"))
+      httpServer.arg("pass").toCharArray(cfg.wifi_pass, 65);
     else
       cfg.wifi_pass[0] = '\0';
+    if (httpServer.hasArg("host"))
+      httpServer.arg("host").toCharArray(cfg.ws_host, 65);
+    if (httpServer.hasArg("port"))
+      cfg.ws_port = httpServer.arg("port").toInt();
     saveSettings();
-    server.send(200, "application/json", "{\"ok\":1}");
+    httpServer.send(200, "application/json", "{\"ok\":1}");
     delay(1000);
     ESP.restart();
   } else {
-    server.send(400, "application/json", "{\"err\":\"no ssid\"}");
+    httpServer.send(400, "application/json", "{\"err\":\"no ssid\"}");
   }
 }
 
 void handleWifiReset() {
   cfg.wifi_ssid[0] = '\0';
   cfg.wifi_pass[0] = '\0';
+  cfg.ws_host[0] = '\0';
   saveSettings();
-  server.send(200, "application/json", "{\"ok\":1}");
+  httpServer.send(200, "application/json", "{\"ok\":1}");
   delay(1000);
   ESP.restart();
-}
-
-void handleGet() {
-  String json = "{";
-  json += "\"on\":" + String(ONstate ? 1 : 0);
-  json += ",\"mode\":" + String(this_mode);
-  json += ",\"br\":" + String(cfg.brightness);
-  json += ",\"ebr\":" + String(cfg.empty_bright);
-  json += ",\"ecol\":" + String(cfg.empty_color);
-  json += ",\"sm\":" + String(cfg.smooth, 2);
-  json += ",\"smf\":" + String(cfg.smooth_freq, 2);
-  json += ",\"rs\":" + String(cfg.rainbow_step, 1);
-  json += ",\"mcf\":" + String(cfg.max_coef_freq, 1);
-  json += ",\"mc\":" + String(cfg.max_coef, 1);
-  json += ",\"exp\":" + String(cfg.exp_val, 1);
-  json += ",\"rs2\":" + String(cfg.rainbow_step_2, 1);
-  json += ",\"sp\":" + String(cfg.strobe_period);
-  json += ",\"ss\":" + String(cfg.strobe_smooth);
-  json += ",\"lc\":" + String(cfg.light_color);
-  json += ",\"ls\":" + String(cfg.light_sat);
-  json += ",\"cs\":" + String(cfg.color_speed);
-  json += ",\"rp\":" + String(cfg.rainbow_period);
-  json += ",\"rns\":" + String(cfg.running_speed);
-  json += ",\"hs\":" + String(cfg.hue_start);
-  json += ",\"hst\":" + String(cfg.hue_step);
-  json += ",\"fsm\":" + String(freq_strobe_mode);
-  json += ",\"lm\":" + String(light_mode);
-  json += ",\"lp\":" + String(cfg.low_pass);
-  json += ",\"slp\":" + String(cfg.spektr_low_pass);
-  for (int i = 0; i < 4; i++) {
-    json += ",\"r" + String(i + 1) + "\":" + String(cfg.relay[i] ? 1 : 0);
-  }
-  json += ",\"ip\":\"" + (isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"";
-  json += ",\"ap\":" + String(isAPMode ? 1 : 0);
-  json += "}";
-  server.send(200, "application/json", json);
-}
-
-void handleSet() {
-  bool changed = false;
-
-  if (server.hasArg("on")) {
-    ONstate = server.arg("on").toInt();
-    cfg.on_state = ONstate;
-    if (!ONstate) { fill_solid(leds, NUM_LEDS, CRGB::Black); showStrip(); }
-    changed = true;
-  }
-  if (server.hasArg("mode")) {
-    this_mode = server.arg("mode").toInt();
-    cfg.this_mode = this_mode;
-    changed = true;
-  }
-  if (server.hasArg("br")) {
-    cfg.brightness = server.arg("br").toInt();
-    FastLED.setBrightness(cfg.brightness);
-    changed = true;
-  }
-  if (server.hasArg("ebr")) {
-    cfg.empty_bright = server.arg("ebr").toInt();
-    changed = true;
-  }
-  if (server.hasArg("ecol")) {
-    cfg.empty_color = server.arg("ecol").toInt();
-    changed = true;
-  }
-  if (server.hasArg("sm")) {
-    cfg.smooth = server.arg("sm").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("smf")) {
-    cfg.smooth_freq = server.arg("smf").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("rs")) {
-    cfg.rainbow_step = server.arg("rs").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("mcf")) {
-    cfg.max_coef_freq = server.arg("mcf").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("mc")) {
-    cfg.max_coef = server.arg("mc").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("exp")) {
-    cfg.exp_val = server.arg("exp").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("rs2")) {
-    cfg.rainbow_step_2 = server.arg("rs2").toFloat();
-    changed = true;
-  }
-  if (server.hasArg("sp")) {
-    cfg.strobe_period = server.arg("sp").toInt();
-    light_time = cfg.strobe_period * DEFAULT_STROBE_DUTY / 100;
-    changed = true;
-  }
-  if (server.hasArg("ss")) {
-    cfg.strobe_smooth = server.arg("ss").toInt();
-    changed = true;
-  }
-  if (server.hasArg("lc")) {
-    cfg.light_color = server.arg("lc").toInt();
-    changed = true;
-  }
-  if (server.hasArg("ls")) {
-    cfg.light_sat = server.arg("ls").toInt();
-    changed = true;
-  }
-  if (server.hasArg("cs")) {
-    cfg.color_speed = server.arg("cs").toInt();
-    changed = true;
-  }
-  if (server.hasArg("rp")) {
-    cfg.rainbow_period = server.arg("rp").toInt();
-    changed = true;
-  }
-  if (server.hasArg("rns")) {
-    cfg.running_speed = server.arg("rns").toInt();
-    changed = true;
-  }
-  if (server.hasArg("hs")) {
-    cfg.hue_start = server.arg("hs").toInt();
-    changed = true;
-  }
-  if (server.hasArg("hst")) {
-    cfg.hue_step = server.arg("hst").toInt();
-    changed = true;
-  }
-  if (server.hasArg("fsm")) {
-    freq_strobe_mode = server.arg("fsm").toInt();
-    cfg.freq_strobe_mode = freq_strobe_mode;
-    changed = true;
-  }
-  if (server.hasArg("lm")) {
-    light_mode = server.arg("lm").toInt();
-    cfg.light_mode = light_mode;
-    changed = true;
-  }
-  if (server.hasArg("lp")) {
-    cfg.low_pass = server.arg("lp").toInt();
-    changed = true;
-  }
-  if (server.hasArg("slp")) {
-    cfg.spektr_low_pass = server.arg("slp").toInt();
-    changed = true;
-  }
-
-  for (int i = 0; i < 4; i++) {
-    String key = "r" + String(i + 1);
-    if (server.hasArg(key)) {
-      cfg.relay[i] = server.arg(key).toInt();
-      applyRelay(i);
-      changed = true;
-    }
-  }
-
-  if (changed) markChanged();
-  server.send(200, "application/json", "{\"ok\":1}");
-}
-
-void handleCalibrate() {
-  fullLowPass();
-  String json = "{\"lp\":" + String(cfg.low_pass) + ",\"slp\":" + String(cfg.spektr_low_pass) + "}";
-  server.send(200, "application/json", json);
 }
