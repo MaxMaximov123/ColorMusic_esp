@@ -12,11 +12,12 @@ const { logout } = useAuth()
 const { devices, connected, calibrationResult, sendCommand, requestCalibrate } = useWebSocket()
 
 const selectedTab = ref('cameras')
+let autoSelected = false
 
 watch(devices, (list) => {
-  if (selectedTab.value === 'cameras') return
-  if (list.length > 0 && !selectedTab.value) {
+  if (!autoSelected && list.length > 0) {
     selectedTab.value = list[0].id
+    autoSelected = true
   }
   if (selectedTab.value && selectedTab.value !== 'cameras' && !list.find(d => d.id === selectedTab.value)) {
     selectedTab.value = list.length > 0 ? list[0].id : 'cameras'

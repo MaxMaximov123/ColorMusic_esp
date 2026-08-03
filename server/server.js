@@ -222,7 +222,9 @@ server.on('upgrade', (req, socket, head) => {
     try {
       jwt.verify(token, JWT_SECRET);
     } catch {
-      socket.destroy();
+      wssClient.handleUpgrade(req, socket, head, ws => {
+        ws.close(4001, 'Token expired');
+      });
       return;
     }
     wssClient.handleUpgrade(req, socket, head, ws => wssClient.emit('connection', ws, req));
@@ -235,7 +237,9 @@ server.on('upgrade', (req, socket, head) => {
     try {
       jwt.verify(token, JWT_SECRET);
     } catch {
-      socket.destroy();
+      wssCamera.handleUpgrade(req, socket, head, ws => {
+        ws.close(4001, 'Token expired');
+      });
       return;
     }
     wssCamera.handleUpgrade(req, socket, head, ws => wssCamera.emit('connection', ws, req));

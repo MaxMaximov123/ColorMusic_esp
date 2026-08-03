@@ -23,7 +23,7 @@ let ws = null
 
 const cameraOptions = computed(() =>
   cameras.value.map(c => ({
-    label: `${c.name || c.id}${c.online ? '' : ' (offline)'}`,
+    label: c.name || c.id,
     value: c.id
   }))
 )

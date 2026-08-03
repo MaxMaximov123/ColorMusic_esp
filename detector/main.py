@@ -381,18 +381,22 @@ class StreamPipeline:
     def start(self):
         self.running = True
 
-        if self.detect and self.model_name:
-            try:
-                model_path = self._find_model(self.model_name)
-                self.detector = YoloDetector(model_path)
-                self.detector.start()
-                logger.info(f"YOLO started: {self.model_name}")
-            except Exception as e:
-                logger.error(f"YOLO load failed: {e}")
-                self.detector = None
-
         self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
         self._ws_thread.start()
+
+        if self.detect and self.model_name:
+            threading.Thread(target=self._load_yolo, daemon=True).start()
+
+    def _load_yolo(self):
+        try:
+            model_path = self._find_model(self.model_name)
+            detector = YoloDetector(model_path)
+            detector.start()
+            self.detector = detector
+            logger.info(f"YOLO started: {self.model_name}")
+        except Exception as e:
+            logger.error(f"YOLO load failed: {e}")
+            self.detector = None
 
     def stop(self):
         self.running = False
@@ -415,10 +419,7 @@ class StreamPipeline:
                 pass
 
     def _find_model(self, name: str) -> str:
-        p = os.path.join(MODELS_DIR, name)
-        if os.path.isfile(p):
-            return p
-        return name
+        return os.path.join(MODELS_DIR, name)
 
     _ws = None
     _ffmpeg_stdin = None
