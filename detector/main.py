@@ -85,25 +85,46 @@ class IpeyeClient:
 
     def get_cameras(self) -> list[dict]:
         try:
+            data = {
+                "draw": "1",
+                "start": "0",
+                "length": "100",
+                "search[value]": "",
+                "search[regex]": "true",
+                "order[0][column]": "2",
+                "order[0][dir]": "asc",
+            }
+            col_names = [
+                "devices.devcode", "devices.devcode", "devices.name",
+                "devices_groups.name", "tariffs.name", "devices.dvr_limit",
+                "", "", "", "devices_groups.id", "devices.permissions",
+                "devices.model_id", "devices.storage_server",
+            ]
+            for i, col_data in enumerate(col_names):
+                data[f"columns[{i}][data]"] = col_data
+                data[f"columns[{i}][name]"] = ""
+                data[f"columns[{i}][searchable]"] = "true" if col_data else "false"
+                data[f"columns[{i}][orderable]"] = "true" if col_data else "false"
+                data[f"columns[{i}][search][value]"] = ""
+                data[f"columns[{i}][search][regex]"] = "false"
+
             resp = self.session.post(
                 f"{self.BASE_URL}?route=proc_device",
-                data={
-                    "draw": "1",
-                    "start": "0",
-                    "length": "100",
-                    "search[value]": "",
-                    "order[0][column]": "1",
-                    "order[0][dir]": "asc",
+                data=data,
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Referer": f"{self.BASE_URL}?route=page_index",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 },
-                headers={"X-Requested-With": "XMLHttpRequest"},
                 timeout=15,
             )
             if resp.status_code != 200:
                 return []
 
-            data = resp.json()
+            result = resp.json()
             cameras = []
-            for item in data.get("data", []):
+            for item in result.get("data", []):
                 cameras.append({
                     "id": item.get("devcode", ""),
                     "name": item.get("device_name", ""),
@@ -119,7 +140,13 @@ class IpeyeClient:
         try:
             resp = self.session.post(
                 f"{self.API_URL}/v1/stream/status_array_full",
-                json={"streams": device_ids},
+                data={"streams": json.dumps(device_ids)},
+                headers={
+                    "Accept": "*/*",
+                    "Referer": f"{self.BASE_URL}?route=page_index",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": self.SITE_URL,
+                },
                 timeout=10,
             )
             if resp.status_code == 200:
