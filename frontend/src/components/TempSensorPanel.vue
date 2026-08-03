@@ -128,10 +128,7 @@ async function enterChartFullscreen() {
   await nextTick()
   const el = chartWrapRef.value
   if (el) {
-    try {
-      if (el.requestFullscreen) el.requestFullscreen()
-      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen()
-    } catch {}
+    try { (el.requestFullscreen || el.webkitRequestFullscreen).call(el) } catch {}
   }
   try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
 }
@@ -144,11 +141,6 @@ function exitChartFullscreen() {
     else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
   } catch {}
   try { screen.orientation.unlock() } catch {}
-}
-
-function toggleChartFullscreen() {
-  if (chartFullscreen.value) exitChartFullscreen()
-  else enterChartFullscreen()
 }
 
 onMounted(() => {
@@ -168,7 +160,6 @@ onUnmounted(() => {
 
 <template>
   <div class="temp-sensor-panel">
-    <!-- Current temperature -->
     <q-card dark class="section-card q-mb-sm">
       <q-card-section class="text-center q-pa-lg">
         <div class="temp-display" :class="{ offline: !online }">
@@ -187,7 +178,6 @@ onUnmounted(() => {
       </q-card-section>
     </q-card>
 
-    <!-- Threshold -->
     <q-card dark class="section-card q-mb-sm">
       <q-card-section class="q-pa-sm">
         <div class="section-title">Порог уведомления</div>
@@ -198,7 +188,6 @@ onUnmounted(() => {
       </q-card-section>
     </q-card>
 
-    <!-- Notifications -->
     <q-card dark class="section-card q-mb-sm">
       <q-card-section class="q-pa-sm">
         <div class="notify-row">
@@ -208,7 +197,6 @@ onUnmounted(() => {
       </q-card-section>
     </q-card>
 
-    <!-- Temperature chart -->
     <q-card dark class="section-card q-mb-sm">
       <q-card-section class="q-pa-sm">
         <div class="row items-center justify-between q-mb-xs">
@@ -230,23 +218,23 @@ onUnmounted(() => {
       </q-card-section>
     </q-card>
 
-    <!-- Chart fullscreen overlay — only chart + close button -->
-    <div v-if="chartFullscreen" ref="chartWrapRef" class="chart-fs-overlay">
-      <div class="chart-fs-inner">
-        <Line
-          v-if="chartData.labels.length > 0"
-          :data="chartData"
-          :options="chartOptions"
-          :key="'fs'"
-        />
-        <div v-else class="text-center text-grey-6" style="margin:auto;">Нет данных</div>
+    <!-- Chart fullscreen — teleported to body, outside Quasar layout -->
+    <Teleport to="body">
+      <div v-if="chartFullscreen" ref="chartWrapRef" class="temp-chart-fs-overlay">
+        <div class="temp-chart-fs-inner">
+          <Line
+            v-if="chartData.labels.length > 0"
+            :data="chartData"
+            :options="chartOptions"
+            :key="'fs'"
+          />
+          <div v-else class="text-center text-grey-6" style="margin:auto;">Нет данных</div>
+        </div>
+        <button class="temp-chart-fs-close" @click="exitChartFullscreen">
+          <span class="material-icons">close</span>
+        </button>
       </div>
-      <q-btn
-        flat round icon="close" size="md"
-        class="chart-fs-close"
-        @click="exitChartFullscreen"
-      />
-    </div>
+    </Teleport>
   </div>
 </template>
 
@@ -269,32 +257,25 @@ onUnmounted(() => {
 
 .chart-container { position: relative; height: 250px; min-height: 200px; }
 .chart-loading { opacity: 0.5; }
+</style>
 
-/* Chart fullscreen — clean overlay, only chart + close */
-.chart-fs-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
+<!-- Unscoped — Teleport renders outside component scope -->
+<style>
+.temp-chart-fs-overlay {
+  position: fixed; inset: 0; z-index: 99999;
   background: #111;
-  display: flex;
-  align-items: stretch;
-  justify-content: stretch;
+  display: flex; align-items: stretch; justify-content: stretch;
   padding: 12px;
 }
-
-.chart-fs-inner {
-  flex: 1;
-  position: relative;
-  min-width: 0;
-  min-height: 0;
+.temp-chart-fs-inner {
+  flex: 1; position: relative; min-width: 0; min-height: 0;
 }
-
-.chart-fs-close {
-  position: fixed;
-  top: 12px;
-  right: 12px;
-  z-index: 10000;
-  background: rgba(255,255,255,0.12) !important;
-  color: white !important;
+.temp-chart-fs-close {
+  position: fixed; top: 16px; right: 16px; z-index: 100000;
+  width: 44px; height: 44px; border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(255,255,255,0.15); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0;
 }
+.temp-chart-fs-close .material-icons { font-size: 28px; }
 </style>

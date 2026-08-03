@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useAuth } from '../composables/useAuth.js'
 
 const { getToken } = useAuth()
@@ -18,28 +18,24 @@ const isFullscreen = ref(false)
 const autoConnecting = ref(true)
 
 const canvasRef = ref(null)
-const videoContainerRef = ref(null)
+const fsCanvasRef = ref(null)
+const fsOverlayRef = ref(null)
 let ws = null
 
 const cameraOptions = computed(() =>
-  cameras.value.map(c => ({
-    label: c.name || c.id,
-    value: c.id
-  }))
+  cameras.value.map(c => ({ label: c.name || c.id, value: c.id }))
 )
 
 function onFullscreenChange() {
   if (!document.fullscreenElement && !document.webkitFullscreenElement) {
     isFullscreen.value = false
     document.body.style.overflow = ''
-    try { screen.orientation.unlock() } catch {}
   }
 }
 
 onMounted(async () => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
   document.addEventListener('webkitfullscreenchange', onFullscreenChange)
-
   try {
     const resp = await fetch('/api/ipeye/connect', {
       headers: { 'Authorization': `Bearer ${getToken()}` }
@@ -48,9 +44,7 @@ onMounted(async () => {
     if (data.session) {
       ipeyeSession.value = data.session
       cameras.value = data.cameras || []
-      if (cameras.value.length > 0) {
-        selectedCamera.value = cameras.value[0].id
-      }
+      if (cameras.value.length > 0) selectedCamera.value = cameras.value[0].id
     }
   } catch {}
   autoConnecting.value = false
@@ -66,76 +60,38 @@ onUnmounted(() => {
 async function doIpeyeLogin() {
   loginLoading.value = true
   loginError.value = ''
-
   try {
     const resp = await fetch('/api/detector/login', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${getToken()}`
-      },
-      body: JSON.stringify({
-        login: ipeyeLogin.value,
-        password: ipeyePassword.value
-      })
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` },
+      body: JSON.stringify({ login: ipeyeLogin.value, password: ipeyePassword.value })
     })
-
     const data = await resp.json()
-
-    if (!resp.ok) {
-      loginError.value = data.error || 'Ошибка авторизации'
-      return
-    }
-
+    if (!resp.ok) { loginError.value = data.error || 'Ошибка авторизации'; return }
     ipeyeSession.value = data.session
     cameras.value = data.cameras || []
-    if (cameras.value.length > 0) {
-      selectedCamera.value = cameras.value[0].id
-    }
-
+    if (cameras.value.length > 0) selectedCamera.value = cameras.value[0].id
     fetch('/api/ipeye/save', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${getToken()}`
-      },
-      body: JSON.stringify({
-        login: ipeyeLogin.value,
-        password: ipeyePassword.value
-      })
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` },
+      body: JSON.stringify({ login: ipeyeLogin.value, password: ipeyePassword.value })
     }).catch(() => {})
-  } catch (e) {
-    loginError.value = 'Сервис видеонаблюдения недоступен'
-  } finally {
-    loginLoading.value = false
-  }
+  } catch { loginError.value = 'Сервис видеонаблюдения недоступен' }
+  finally { loginLoading.value = false }
 }
 
-function toggleStream() {
-  if (streaming.value) stopStream()
-  else startStream()
-}
+function toggleStream() { streaming.value ? stopStream() : startStream() }
 
 function startStream() {
   if (!selectedCamera.value || !ipeyeSession.value) return
-
   streamError.value = ''
   streamStatus.value = 'Подключение...'
-
-  const token = getToken()
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${location.host}/ws/camera?token=${encodeURIComponent(token)}`
-
-  ws = new WebSocket(wsUrl)
-
+  ws = new WebSocket(`${protocol}//${location.host}/ws/camera?token=${encodeURIComponent(getToken())}`)
   ws.onopen = () => {
-    ws.send(JSON.stringify({
-      session: ipeyeSession.value,
-      camera: selectedCamera.value
-    }))
+    ws.send(JSON.stringify({ session: ipeyeSession.value, camera: selectedCamera.value }))
     streaming.value = true
   }
-
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {
       try {
@@ -143,46 +99,38 @@ function startStream() {
         if (msg.status) streamStatus.value = msg.status === 'connecting' ? 'Подключение к камере...' : msg.status
         if (msg.error) { streamError.value = msg.error; streamStatus.value = '' }
       } catch {}
-    } else {
-      streamStatus.value = ''
-      renderFrame(event.data)
-    }
+    } else { streamStatus.value = ''; renderFrame(event.data) }
   }
-
   ws.onclose = () => { streaming.value = false; streamStatus.value = '' }
   ws.onerror = () => { streamError.value = 'Ошибка соединения'; streaming.value = false }
 }
 
 function stopStream() {
   if (ws) { ws.close(); ws = null }
-  streaming.value = false
-  streamStatus.value = ''
+  streaming.value = false; streamStatus.value = ''
 }
 
 function renderFrame(blob) {
-  const canvas = canvasRef.value
+  const canvas = isFullscreen.value ? fsCanvasRef.value : canvasRef.value
   if (!canvas) return
   const url = URL.createObjectURL(new Blob([blob], { type: 'image/jpeg' }))
   const img = new Image()
   img.onload = () => {
-    const ctx = canvas.getContext('2d')
-    canvas.width = img.width
-    canvas.height = img.height
-    ctx.drawImage(img, 0, 0)
+    canvas.width = img.width; canvas.height = img.height
+    canvas.getContext('2d').drawImage(img, 0, 0)
     URL.revokeObjectURL(url)
   }
   img.src = url
 }
 
-function enterFullscreen() {
-  const el = videoContainerRef.value
-  if (!el) return
+async function enterFullscreen() {
   isFullscreen.value = true
   document.body.style.overflow = 'hidden'
-  try {
-    if (el.requestFullscreen) el.requestFullscreen()
-    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen()
-  } catch {}
+  await nextTick()
+  const el = fsOverlayRef.value
+  if (el) {
+    try { (el.requestFullscreen || el.webkitRequestFullscreen).call(el) } catch {}
+  }
   try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
 }
 
@@ -196,21 +144,11 @@ function exitFullscreen() {
   try { screen.orientation.unlock() } catch {}
 }
 
-function toggleFullscreen() {
-  if (isFullscreen.value) exitFullscreen()
-  else enterFullscreen()
-}
-
 function doIpeyeLogout() {
   stopStream()
-  ipeyeSession.value = null
-  cameras.value = []
-  ipeyeLogin.value = ''
-  ipeyePassword.value = ''
-  fetch('/api/ipeye/forget', {
-    method: 'DELETE',
-    headers: { 'Authorization': `Bearer ${getToken()}` }
-  }).catch(() => {})
+  ipeyeSession.value = null; cameras.value = []
+  ipeyeLogin.value = ''; ipeyePassword.value = ''
+  fetch('/api/ipeye/forget', { method: 'DELETE', headers: { 'Authorization': `Bearer ${getToken()}` } }).catch(() => {})
 }
 </script>
 
@@ -235,8 +173,8 @@ function doIpeyeLogout() {
       <q-card dark class="section-card q-mb-sm">
         <q-card-section class="q-pa-sm">
           <div class="row items-center justify-between q-mb-sm">
-            <div class="section-title" style="margin-bottom: 0;">Камеры</div>
-            <q-btn flat dense size="sm" color="grey-5" icon="logout" title="Забыть учётные данные" @click="doIpeyeLogout" />
+            <div class="section-title" style="margin-bottom:0;">Камеры</div>
+            <q-btn flat dense size="sm" color="grey-5" icon="logout" @click="doIpeyeLogout" />
           </div>
           <q-select v-model="selectedCamera" :options="cameraOptions" emit-value map-options filled dense dark label="Камера" class="q-mb-sm" :disable="streaming" />
           <div class="row items-center justify-end">
@@ -248,84 +186,68 @@ function doIpeyeLogout() {
       <q-card v-if="streaming || streamError" dark class="section-card">
         <q-card-section class="q-pa-none">
           <div v-if="streamStatus" class="stream-status text-center q-pa-lg">
-            <q-spinner color="primary" size="2em" class="q-mr-sm" />
-            {{ streamStatus }}
+            <q-spinner color="primary" size="2em" class="q-mr-sm" />{{ streamStatus }}
           </div>
           <div v-if="streamError" class="text-negative text-center q-pa-md text-caption">{{ streamError }}</div>
-          <div
-            ref="videoContainerRef"
-            class="video-container"
-            :class="{ 'is-fullscreen': isFullscreen, hidden: !!streamStatus && !streamError }"
-          >
-            <canvas ref="canvasRef" class="video-canvas" />
-            <q-btn
-              flat round
-              :icon="isFullscreen ? 'close' : 'fullscreen'"
-              :size="isFullscreen ? 'md' : 'sm'"
-              class="fs-btn"
-              :class="{ 'fs-btn-exit': isFullscreen }"
-              @click="toggleFullscreen"
-            />
+          <div class="video-inline" :class="{ hidden: !!streamStatus && !streamError }">
+            <canvas ref="canvasRef" class="video-inline-canvas" />
+            <button class="fs-enter-btn" @click="enterFullscreen">
+              <span class="material-icons">fullscreen</span>
+            </button>
           </div>
         </q-card-section>
       </q-card>
     </template>
+
+    <!-- Fullscreen overlay — teleported to body, outside Quasar layout -->
+    <Teleport to="body">
+      <div v-if="isFullscreen" ref="fsOverlayRef" class="cam-fs-overlay">
+        <canvas ref="fsCanvasRef" class="cam-fs-canvas" />
+        <button class="cam-fs-close" @click="exitFullscreen">
+          <span class="material-icons">close</span>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
 <style scoped>
-.section-card {
-  background: #1a1a2e !important;
-  border-radius: 8px;
-}
-.section-title {
-  font-size: 0.85rem; font-weight: 600; color: #aaa;
-  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
-}
+.section-card { background: #1a1a2e !important; border-radius: 8px; }
+.section-title { font-size: 0.85rem; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
+.stream-status { color: #aaa; font-size: 0.9rem; }
 
-.video-container {
-  position: relative;
-  background: #000;
-  border-radius: 0 0 8px 8px;
-  line-height: 0;
-}
-.video-canvas {
-  display: block; width: 100%; height: auto;
-  border-radius: 0 0 8px 8px;
-}
-.video-container.hidden { display: none; }
+.video-inline { position: relative; background: #000; border-radius: 0 0 8px 8px; line-height: 0; }
+.video-inline.hidden { display: none; }
+.video-inline-canvas { display: block; width: 100%; height: auto; border-radius: 0 0 8px 8px; }
 
-/* Fullscreen enter button */
-.fs-btn {
+.fs-enter-btn {
   position: absolute; top: 8px; right: 8px;
-  background: rgba(0,0,0,0.5) !important;
-  color: white !important;
+  width: 36px; height: 36px; border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(0,0,0,0.5); color: #fff;
+  display: flex; align-items: center; justify-content: center;
   opacity: 0; transition: opacity 0.2s;
 }
-.video-container:hover .fs-btn { opacity: 1; }
-@media (pointer: coarse) { .fs-btn { opacity: 0.7 !important; } }
+.video-inline:hover .fs-enter-btn { opacity: 1; }
+@media (pointer: coarse) { .fs-enter-btn { opacity: 0.7; } }
+</style>
 
-/* Fullscreen mode */
-.video-container.is-fullscreen {
-  position: fixed; inset: 0; z-index: 9999;
+<!-- Unscoped — Teleport renders outside component scope -->
+<style>
+.cam-fs-overlay {
+  position: fixed; inset: 0; z-index: 99999;
   background: #000;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 0;
 }
-.video-container.is-fullscreen .video-canvas {
-  width: auto; height: auto;
+.cam-fs-canvas {
   max-width: 100%; max-height: 100%;
-  border-radius: 0;
+  width: auto; height: auto;
 }
-
-/* Exit button — always visible in fullscreen */
-.fs-btn-exit {
-  position: fixed !important;
-  top: 16px; right: 16px;
-  z-index: 10000;
-  opacity: 1 !important;
-  background: rgba(0,0,0,0.6) !important;
+.cam-fs-close {
+  position: fixed; top: 16px; right: 16px; z-index: 100000;
+  width: 44px; height: 44px; border-radius: 50%; border: none; cursor: pointer;
+  background: rgba(255,255,255,0.15); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0;
 }
-
-.stream-status { color: #aaa; font-size: 0.9rem; }
+.cam-fs-close .material-icons { font-size: 28px; }
 </style>
