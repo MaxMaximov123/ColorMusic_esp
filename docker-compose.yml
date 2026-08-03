@@ -1,8 +1,23 @@
 services:
-  colormusic:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-smarthome}
+      POSTGRES_USER: ${DB_USER:-smarthome}
+      POSTGRES_PASSWORD: ${DB_PASS:-smarthome}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./server/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  app:
     build: .
     ports:
-      - "3000:3000"
-    environment:
-      - PORT=3000
+      - "${PORT:-3000}:${PORT:-3000}"
+    env_file: .env
+    depends_on:
+      - postgres
     restart: unless-stopped
+
+volumes:
+  pgdata:

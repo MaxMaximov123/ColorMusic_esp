@@ -402,7 +402,7 @@ String buildStateJson() {
 }
 
 void sendHello() {
-  String msg = "{\"type\":\"hello\",\"deviceId\":\"" + deviceId + "\",\"name\":\"ColorMusic\",\"state\":" + buildStateJson() + "}";
+  String msg = "{\"type\":\"hello\",\"deviceId\":\"" + deviceId + "\",\"name\":\"ColorMusic\",\"deviceType\":\"colormusic\",\"state\":" + buildStateJson() + "}";
   wsClient.sendTXT(msg);
 }
 

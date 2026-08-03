@@ -1,16 +1,22 @@
 import { ref, onUnmounted } from 'vue'
+import { useAuth } from './useAuth.js'
 
 export function useWebSocket() {
   const devices = ref([])
   const connected = ref(false)
   const calibrationResult = ref(null)
 
+  const { getToken } = useAuth()
+
   let ws = null
   let reconnectTimer = null
 
   function connect() {
+    const token = getToken()
+    if (!token) return
+
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${protocol}//${location.host}/ws/client`
+    const url = `${protocol}//${location.host}/ws/client?token=${encodeURIComponent(token)}`
 
     ws = new WebSocket(url)
 
@@ -18,9 +24,18 @@ export function useWebSocket() {
       connected.value = true
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       connected.value = false
       ws = null
+
+      // Code 1008 or immediate close may mean auth rejected
+      if (event.code === 1008 || event.code === 4001) {
+        // Auth rejected, redirect to login
+        localStorage.removeItem('token')
+        window.location.href = '/login'
+        return
+      }
+
       scheduleReconnect()
     }
 

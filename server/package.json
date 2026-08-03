@@ -1,7 +1,7 @@
 {
-  "name": "colormusic-server",
-  "version": "1.0.0",
-  "description": "WebSocket bridge between ESP8266 ColorMusic devices and web clients",
+  "name": "smarthome-server",
+  "version": "2.0.0",
+  "description": "Smart Home WebSocket bridge with auth and DB",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,11 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "knex": "^3.1.0",
+    "pg": "^8.13.0",
     "ws": "^8.18.0"
   }
 }

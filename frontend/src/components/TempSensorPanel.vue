@@ -1,0 +1,348 @@
+<script setup>
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { Line } from 'vue-chartjs'
+import {
+  Chart as ChartJS,
+  LineElement,
+  PointElement,
+  LinearScale,
+  CategoryScale,
+  Filler,
+  Tooltip,
+  Legend
+} from 'chart.js'
+import { useApi } from '../composables/useApi.js'
+
+ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Filler, Tooltip, Legend)
+
+const props = defineProps({
+  device: { type: Object, required: true }
+})
+
+const emit = defineEmits(['command'])
+
+const { fetchTemperatureHistory } = useApi()
+
+const state = computed(() => props.device.state || {})
+const temp = computed(() => state.value.temp ?? null)
+const threshold = computed(() => state.value.threshold ?? 0)
+const notify = computed(() => !!(state.value.notify))
+const online = computed(() => props.device.online)
+
+// Threshold input
+const thresholdInput = ref(threshold.value)
+
+watch(threshold, (val) => {
+  thresholdInput.value = val
+})
+
+function onThresholdChange(val) {
+  const num = parseFloat(val)
+  if (!isNaN(num)) {
+    emit('command', { threshold: num })
+  }
+}
+
+function onNotifyToggle(val) {
+  emit('command', { notify: val ? 1 : 0 })
+}
+
+// Chart
+const hoursOptions = [
+  { label: '6ч', value: 6 },
+  { label: '24ч', value: 24 },
+  { label: '7д', value: 168 }
+]
+
+const selectedHours = ref(24)
+const historyData = ref([])
+const chartLoading = ref(false)
+
+let refreshTimer = null
+
+const chartData = computed(() => {
+  const labels = historyData.value.map(p => {
+    const d = new Date(p.recorded_at)
+    if (selectedHours.value <= 24) {
+      return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+    }
+    return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }) + ' ' +
+           d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+  })
+
+  const temps = historyData.value.map(p => p.temperature)
+
+  const datasets = [
+    {
+      label: 'Температура',
+      data: temps,
+      borderColor: '#2ee8b7',
+      backgroundColor: 'rgba(46, 232, 183, 0.1)',
+      fill: true,
+      tension: 0.4,
+      pointRadius: 0,
+      pointHitRadius: 10,
+      borderWidth: 2
+    }
+  ]
+
+  // Threshold line
+  if (threshold.value != null && temps.length > 0) {
+    datasets.push({
+      label: 'Порог',
+      data: Array(labels.length).fill(threshold.value),
+      borderColor: '#f44336',
+      borderDash: [6, 4],
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: false
+    })
+  }
+
+  return { labels, datasets }
+})
+
+const chartOptions = computed(() => ({
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: {
+    legend: {
+      display: true,
+      labels: { color: '#aaa', boxWidth: 12, font: { size: 11 } }
+    },
+    tooltip: {
+      mode: 'index',
+      intersect: false,
+      callbacks: {
+        label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}°C`
+      }
+    }
+  },
+  scales: {
+    x: {
+      ticks: { color: '#666', maxTicksLimit: 8, font: { size: 10 } },
+      grid: { color: 'rgba(255,255,255,0.05)' }
+    },
+    y: {
+      ticks: {
+        color: '#666',
+        font: { size: 11 },
+        callback: (v) => v + '°C'
+      },
+      grid: { color: 'rgba(255,255,255,0.05)' }
+    }
+  },
+  interaction: {
+    mode: 'nearest',
+    axis: 'x',
+    intersect: false
+  }
+}))
+
+async function loadHistory() {
+  chartLoading.value = true
+  try {
+    const data = await fetchTemperatureHistory(props.device.id, selectedHours.value)
+    historyData.value = data
+  } catch (e) {
+    console.error('Failed to load temperature history:', e)
+  } finally {
+    chartLoading.value = false
+  }
+}
+
+watch(selectedHours, () => {
+  loadHistory()
+})
+
+function startAutoRefresh() {
+  stopAutoRefresh()
+  refreshTimer = setInterval(loadHistory, 60000)
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+}
+
+onMounted(() => {
+  loadHistory()
+  startAutoRefresh()
+})
+
+onUnmounted(() => {
+  stopAutoRefresh()
+})
+</script>
+
+<template>
+  <div class="temp-sensor-panel">
+    <!-- Current temperature -->
+    <q-card dark class="section-card q-mb-sm">
+      <q-card-section class="text-center q-pa-lg">
+        <div class="temp-display" :class="{ offline: !online }">
+          <template v-if="temp !== null">
+            <span class="temp-value">{{ temp.toFixed(1) }}</span>
+            <span class="temp-unit">°C</span>
+          </template>
+          <template v-else>
+            <span class="temp-value temp-na">--</span>
+            <span class="temp-unit">°C</span>
+          </template>
+        </div>
+        <div class="q-mt-sm">
+          <q-badge
+            :color="online ? 'green' : 'red'"
+            :label="online ? 'В сети' : 'Не в сети'"
+          />
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <!-- Threshold -->
+    <q-card dark class="section-card q-mb-sm">
+      <q-card-section class="q-pa-sm">
+        <div class="section-title">Порог уведомления</div>
+        <div class="threshold-row">
+          <q-slider
+            v-model="thresholdInput"
+            :min="-10" :max="30" :step="0.5"
+            color="primary"
+            label
+            :label-value="thresholdInput + '°C'"
+            class="q-mr-md"
+            style="flex: 1;"
+            @change="onThresholdChange"
+          />
+          <q-input
+            v-model.number="thresholdInput"
+            type="number"
+            filled
+            dense
+            dark
+            style="width: 80px;"
+            :step="0.5"
+            @change="onThresholdChange(thresholdInput)"
+          />
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <!-- Notifications -->
+    <q-card dark class="section-card q-mb-sm">
+      <q-card-section class="q-pa-sm">
+        <div class="notify-row">
+          <span class="notify-label">Уведомления в Telegram</span>
+          <q-toggle
+            :model-value="notify"
+            color="primary"
+            @update:model-value="onNotifyToggle"
+          />
+        </div>
+      </q-card-section>
+    </q-card>
+
+    <!-- Temperature chart -->
+    <q-card dark class="section-card q-mb-sm">
+      <q-card-section class="q-pa-sm">
+        <div class="section-title">История температуры</div>
+
+        <q-btn-toggle
+          v-model="selectedHours"
+          :options="hoursOptions"
+          color="grey-8"
+          text-color="grey-4"
+          toggle-color="primary"
+          toggle-text-color="dark"
+          no-caps
+          spread
+          class="q-mb-md"
+          dense
+        />
+
+        <div class="chart-container" :class="{ 'chart-loading': chartLoading }">
+          <q-inner-loading :showing="chartLoading" color="primary" />
+          <Line
+            v-if="chartData.labels.length > 0"
+            :data="chartData"
+            :options="chartOptions"
+          />
+          <div v-else-if="!chartLoading" class="text-center text-grey-6 q-pa-lg">
+            Нет данных
+          </div>
+        </div>
+      </q-card-section>
+    </q-card>
+  </div>
+</template>
+
+<style scoped>
+.section-card {
+  background: #1a1a2e !important;
+  border-radius: 8px;
+}
+
+.section-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #aaa;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 10px;
+}
+
+.temp-display {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.temp-display.offline {
+  opacity: 0.4;
+}
+
+.temp-value {
+  font-size: 4rem;
+  font-weight: 700;
+  color: #2ee8b7;
+  line-height: 1;
+}
+
+.temp-value.temp-na {
+  color: #666;
+}
+
+.temp-unit {
+  font-size: 2rem;
+  font-weight: 400;
+  color: #888;
+  margin-left: 4px;
+}
+
+.threshold-row {
+  display: flex;
+  align-items: center;
+}
+
+.notify-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.notify-label {
+  font-size: 0.9rem;
+  color: #ccc;
+}
+
+.chart-container {
+  position: relative;
+  height: 250px;
+  min-height: 200px;
+}
+
+.chart-loading {
+  opacity: 0.5;
+}
+</style>

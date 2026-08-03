@@ -2,46 +2,157 @@ const http = require('http');
 const express = require('express');
 const path = require('path');
 const { WebSocketServer } = require('ws');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const url = require('url');
+const knex = require('knex');
 
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
+const JWT_EXPIRES = '24h';
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'admin';
 
-// --- Express ---
+// ── Database (knex) ──
+
+const db = knex({
+  client: 'pg',
+  connection: {
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432'),
+    database: process.env.DB_NAME || 'smarthome',
+    user: process.env.DB_USER || 'smarthome',
+    password: process.env.DB_PASS || 'smarthome',
+  },
+  pool: { min: 1, max: 10 },
+});
+
+async function waitForDB(retries = 20, delay = 2000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await db.raw('SELECT 1');
+      console.log('[db] connected');
+      return;
+    } catch (err) {
+      console.log(`[db] waiting... (${i + 1}/${retries})`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error('Could not connect to database');
+}
+
+async function initDB() {
+  if (!(await db.schema.hasTable('users'))) {
+    await db.schema.createTable('users', t => {
+      t.increments('id').primary();
+      t.string('username', 50).unique().notNullable();
+      t.string('password_hash', 255).notNullable();
+      t.timestamp('created_at').defaultTo(db.fn.now());
+    });
+  }
+
+  if (!(await db.schema.hasTable('devices'))) {
+    await db.schema.createTable('devices', t => {
+      t.string('id', 64).primary();
+      t.string('name', 100).notNullable().defaultTo('');
+      t.string('device_type', 20).notNullable().defaultTo('unknown');
+      t.timestamp('last_seen');
+      t.timestamp('created_at').defaultTo(db.fn.now());
+    });
+  }
+
+  if (!(await db.schema.hasTable('temperature_history'))) {
+    await db.schema.createTable('temperature_history', t => {
+      t.bigIncrements('id').primary();
+      t.string('device_id', 64).notNullable()
+        .references('id').inTable('devices').onDelete('CASCADE');
+      t.float('temperature').notNullable();
+      t.timestamp('recorded_at').defaultTo(db.fn.now());
+      t.index(['device_id', 'recorded_at']);
+    });
+  }
+
+  const admin = await db('users').where('username', ADMIN_USER).first();
+  if (!admin) {
+    const hash = await bcrypt.hash(ADMIN_PASS, 10);
+    await db('users').insert({ username: ADMIN_USER, password_hash: hash });
+    console.log(`[db] admin user "${ADMIN_USER}" created`);
+  }
+}
+
+// ── Express ──
+
 const app = express();
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const server = http.createServer(app);
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token' });
+  }
+  try {
+    req.user = jwt.verify(header.slice(7), JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
 
-// --- State ---
-const devices = new Map();   // deviceId -> { ws, state, name, online }
-const clients = new Set();   // Set<WebSocket>
-
-// --- WebSocket servers (one per path) ---
-const wssDevice = new WebSocketServer({ noServer: true });
-const wssClient = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (req, socket, head) => {
-  const { pathname } = url.parse(req.url);
-
-  if (pathname === '/ws/device') {
-    wssDevice.handleUpgrade(req, socket, head, (ws) => {
-      wssDevice.emit('connection', ws, req);
-    });
-  } else if (pathname === '/ws/client') {
-    wssClient.handleUpgrade(req, socket, head, (ws) => {
-      wssClient.emit('connection', ws, req);
-    });
-  } else {
-    socket.destroy();
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
+  try {
+    const user = await db('users').where('username', username).first();
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ id: user.id, username }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+    res.json({ token, username });
+  } catch (err) {
+    console.error('[login]', err.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// --- Helpers ---
+app.get('/api/devices', authMiddleware, (req, res) => {
+  res.json(buildDeviceList());
+});
+
+app.get('/api/temperature/:deviceId', authMiddleware, async (req, res) => {
+  const hours = parseInt(req.query.hours) || 24;
+  try {
+    const rows = await db('temperature_history')
+      .where('device_id', req.params.deviceId)
+      .where('recorded_at', '>', db.raw("NOW() - INTERVAL '1 hour' * ?", [hours]))
+      .orderBy('recorded_at', 'asc')
+      .select('temperature', 'recorded_at');
+    res.json(rows);
+  } catch (err) {
+    console.error('[temp-history]', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ── State ──
+
+const devices = new Map();
+const clients = new Set();
 
 function buildDeviceList() {
   const list = [];
   for (const [id, dev] of devices) {
-    list.push({ id, name: dev.name, online: dev.online, state: dev.state });
+    list.push({ id, name: dev.name, deviceType: dev.deviceType, online: dev.online, state: dev.state });
   }
   return list;
 }
@@ -57,38 +168,71 @@ function sendJson(ws, obj) {
   if (ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
-// --- Device connections ---
+// ── WebSocket ──
+
+const server = http.createServer(app);
+const wssDevice = new WebSocketServer({ noServer: true });
+const wssClient = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const { pathname, query } = url.parse(req.url, true);
+
+  if (pathname === '/ws/device') {
+    wssDevice.handleUpgrade(req, socket, head, ws => wssDevice.emit('connection', ws, req));
+    return;
+  }
+
+  if (pathname === '/ws/client') {
+    const token = query.token;
+    if (!token) { socket.destroy(); return; }
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch {
+      socket.destroy();
+      return;
+    }
+    wssClient.handleUpgrade(req, socket, head, ws => wssClient.emit('connection', ws, req));
+    return;
+  }
+
+  socket.destroy();
+});
+
+// ── Device connections ──
 
 wssDevice.on('connection', (ws, req) => {
   let deviceId = null;
-  console.log('[device] new connection from', req.socket.remoteAddress);
+  console.log('[device] connected from', req.socket.remoteAddress);
 
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw);
-    } catch (err) {
-      console.log('[device] bad JSON:', err.message);
-      return;
-    }
+    try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'hello' && msg.deviceId) {
       deviceId = msg.deviceId;
       const existing = devices.get(deviceId);
-      // If there was a previous connection, close it
       if (existing && existing.ws && existing.ws !== ws) {
-        try { existing.ws.close(); } catch (_) {}
+        try { existing.ws.close(); } catch {}
       }
+      const deviceType = msg.deviceType || 'unknown';
       devices.set(deviceId, {
         ws,
         state: msg.state || {},
         name: msg.name || deviceId,
+        deviceType,
         online: true,
       });
-      console.log('[device] registered:', deviceId, msg.name || '');
+      console.log('[device] registered:', deviceId, deviceType, msg.name || '');
+
+      db('devices')
+        .insert({ id: deviceId, name: msg.name || deviceId, device_type: deviceType, last_seen: db.fn.now() })
+        .onConflict('id')
+        .merge({ name: msg.name || deviceId, device_type: deviceType, last_seen: db.fn.now() })
+        .catch(err => console.error('[db]', err.message));
+
       broadcastToClients({ type: 'devices', devices: buildDeviceList() });
     }
 
@@ -96,20 +240,24 @@ wssDevice.on('connection', (ws, req) => {
       const dev = devices.get(deviceId);
       if (dev) {
         dev.state = { ...dev.state, ...msg.state };
-        broadcastToClients({
-          type: 'state',
-          deviceId,
-          state: dev.state,
-        });
+
+        if (dev.deviceType === 'tempsensor' && msg.state.temp !== undefined) {
+          db('temperature_history')
+            .insert({ device_id: deviceId, temperature: msg.state.temp })
+            .catch(err => console.error('[db]', err.message));
+        }
+
+        db('devices')
+          .where('id', deviceId)
+          .update({ last_seen: db.fn.now() })
+          .catch(err => console.error('[db]', err.message));
+
+        broadcastToClients({ type: 'state', deviceId, state: dev.state });
       }
     }
 
     if (msg.type === 'calibrate' && deviceId) {
-      broadcastToClients({
-        type: 'calibrate',
-        deviceId,
-        result: msg.result,
-      });
+      broadcastToClients({ type: 'calibrate', deviceId, result: msg.result });
     }
   });
 
@@ -125,31 +273,23 @@ wssDevice.on('connection', (ws, req) => {
     }
   });
 
-  ws.on('error', (err) => {
-    console.log('[device] error:', deviceId || '(unknown)', err.message);
-  });
+  ws.on('error', (err) => console.log('[device] error:', err.message));
 });
 
-// --- Client connections ---
+// ── Client connections ──
 
 wssClient.on('connection', (ws, req) => {
   clients.add(ws);
-  console.log('[client] connected from', req.socket.remoteAddress, `(${clients.size} total)`);
+  console.log('[client] connected', `(${clients.size} total)`);
 
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  // Send current device list on connect
   sendJson(ws, { type: 'devices', devices: buildDeviceList() });
 
   ws.on('message', (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw);
-    } catch (err) {
-      console.log('[client] bad JSON:', err.message);
-      return;
-    }
+    try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'list') {
       sendJson(ws, { type: 'devices', devices: buildDeviceList() });
@@ -158,9 +298,7 @@ wssClient.on('connection', (ws, req) => {
 
     if (msg.type === 'get' && msg.deviceId) {
       const dev = devices.get(msg.deviceId);
-      if (dev) {
-        sendJson(ws, { type: 'state', deviceId: msg.deviceId, state: dev.state });
-      }
+      if (dev) sendJson(ws, { type: 'state', deviceId: msg.deviceId, state: dev.state });
       return;
     }
 
@@ -186,14 +324,10 @@ wssClient.on('connection', (ws, req) => {
     console.log('[client] disconnected', `(${clients.size} remaining)`);
   });
 
-  ws.on('error', (err) => {
-    console.log('[client] error:', err.message);
-  });
+  ws.on('error', (err) => console.log('[client] error:', err.message));
 });
 
-// --- Keepalive ping every 30 seconds ---
-
-const PING_INTERVAL = 30_000;
+// ── Keepalive ──
 
 const pingTimer = setInterval(() => {
   for (const ws of wssDevice.clients) {
@@ -206,15 +340,16 @@ const pingTimer = setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
-}, PING_INTERVAL);
+}, 30_000);
 
 server.on('close', () => clearInterval(pingTimer));
 
-// --- Start ---
+// ── Start ──
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`ColorMusic server listening on 0.0.0.0:${PORT}`);
-  console.log(`  Static files: ${path.join(__dirname, 'public')}`);
-  console.log(`  Device WS:    ws://0.0.0.0:${PORT}/ws/device`);
-  console.log(`  Client WS:    ws://0.0.0.0:${PORT}/ws/client`);
-});
+(async () => {
+  await waitForDB();
+  await initDB();
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`SmartHome server on 0.0.0.0:${PORT}`);
+  });
+})();

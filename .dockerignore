@@ -4,5 +4,6 @@ server/node_modules
 server/public
 firmware
 .DS_Store
+.env
 *.ino
 *.h
