@@ -8,14 +8,10 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy \
-    UV_CACHE_DIR=/root/.cache/uv
-
-COPY pyproject.toml .
-
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --extra-index-url https://download.pytorch.org/whl/cpu \
+    uv pip install --system \
+    --index-strategy unsafe-best-match \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
     fastapi==0.115.6 \
     "uvicorn[standard]==0.34.0" \
     websocket-client==1.8.0 \
