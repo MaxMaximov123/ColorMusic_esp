@@ -15,6 +15,7 @@ const loginError = ref('')
 const streamStatus = ref('')
 const streamError = ref('')
 const isFullscreen = ref(false)
+const autoConnecting = ref(true)
 
 const canvasRef = ref(null)
 const videoContainerRef = ref(null)
@@ -28,16 +29,36 @@ const cameraOptions = computed(() =>
 )
 
 function onFullscreenChange() {
-  isFullscreen.value = !!(document.fullscreenElement || document.webkitFullscreenElement)
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+    isFullscreen.value = false
+    document.body.style.overflow = ''
+    try { screen.orientation.unlock() } catch {}
+  }
 }
 
-onMounted(() => {
+onMounted(async () => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
   document.addEventListener('webkitfullscreenchange', onFullscreenChange)
+
+  try {
+    const resp = await fetch('/api/ipeye/connect', {
+      headers: { 'Authorization': `Bearer ${getToken()}` }
+    })
+    const data = await resp.json()
+    if (data.session) {
+      ipeyeSession.value = data.session
+      cameras.value = data.cameras || []
+      if (cameras.value.length > 0) {
+        selectedCamera.value = cameras.value[0].id
+      }
+    }
+  } catch {}
+  autoConnecting.value = false
 })
 
 onUnmounted(() => {
   stopStream()
+  if (isFullscreen.value) exitFullscreen()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
 })
@@ -71,6 +92,18 @@ async function doIpeyeLogin() {
     if (cameras.value.length > 0) {
       selectedCamera.value = cameras.value[0].id
     }
+
+    fetch('/api/ipeye/save', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${getToken()}`
+      },
+      body: JSON.stringify({
+        login: ipeyeLogin.value,
+        password: ipeyePassword.value
+      })
+    }).catch(() => {})
   } catch (e) {
     loginError.value = 'Сервис видеонаблюдения недоступен'
   } finally {
@@ -117,9 +150,7 @@ function startStream() {
           streamError.value = msg.error
           streamStatus.value = ''
         }
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) { /* ignore */ }
     } else {
       streamStatus.value = ''
       renderFrame(event.data)
@@ -162,14 +193,31 @@ function renderFrame(blob) {
   img.src = url
 }
 
-function toggleFullscreen() {
+function enterFullscreen() {
   const el = videoContainerRef.value
   if (!el) return
-  if (document.fullscreenElement || document.webkitFullscreenElement) {
-    ;(document.exitFullscreen || document.webkitExitFullscreen).call(document)
-  } else {
-    ;(el.requestFullscreen || el.webkitRequestFullscreen).call(el)
-  }
+  isFullscreen.value = true
+  document.body.style.overflow = 'hidden'
+  try {
+    if (el.requestFullscreen) el.requestFullscreen()
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen()
+  } catch {}
+  try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
+}
+
+function exitFullscreen() {
+  isFullscreen.value = false
+  document.body.style.overflow = ''
+  try {
+    if (document.fullscreenElement) document.exitFullscreen()
+    else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
+  } catch {}
+  try { screen.orientation.unlock() } catch {}
+}
+
+function toggleFullscreen() {
+  if (isFullscreen.value) exitFullscreen()
+  else enterFullscreen()
 }
 
 function doIpeyeLogout() {
@@ -178,13 +226,23 @@ function doIpeyeLogout() {
   cameras.value = []
   ipeyeLogin.value = ''
   ipeyePassword.value = ''
+  fetch('/api/ipeye/forget', {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${getToken()}` }
+  }).catch(() => {})
 }
 </script>
 
 <template>
   <div class="camera-panel">
+    <!-- Loading -->
+    <div v-if="autoConnecting" class="text-center q-pa-xl">
+      <q-spinner color="primary" size="2em" />
+      <div class="q-mt-sm text-grey-6 text-caption">Подключение к камерам...</div>
+    </div>
+
     <!-- IPeye Auth -->
-    <q-card v-if="!ipeyeSession" dark class="section-card q-mb-sm">
+    <q-card v-else-if="!ipeyeSession" dark class="section-card q-mb-sm">
       <q-card-section>
         <div class="section-title">Видеонаблюдение — Авторизация</div>
         <q-input
@@ -219,7 +277,12 @@ function doIpeyeLogout() {
         <q-card-section class="q-pa-sm">
           <div class="row items-center justify-between q-mb-sm">
             <div class="section-title" style="margin-bottom: 0;">Камеры</div>
-            <q-btn flat dense icon="logout" size="sm" color="grey-5" @click="doIpeyeLogout" />
+            <q-btn
+              flat dense size="sm" color="grey-5"
+              icon="logout"
+              title="Отключить и забыть учётные данные"
+              @click="doIpeyeLogout"
+            />
           </div>
 
           <q-select
@@ -259,7 +322,7 @@ function doIpeyeLogout() {
           <div
             ref="videoContainerRef"
             class="video-container"
-            :class="{ hidden: !!streamStatus && !streamError }"
+            :class="{ 'is-fullscreen': isFullscreen, hidden: !!streamStatus && !streamError }"
           >
             <canvas ref="canvasRef" class="video-canvas" />
             <q-btn
@@ -322,35 +385,37 @@ function doIpeyeLogout() {
   opacity: 1;
 }
 
-.video-container:fullscreen,
-.video-container:-webkit-full-screen {
+@media (pointer: coarse) {
+  .fullscreen-btn {
+    opacity: 0.7 !important;
+  }
+}
+
+.video-container.is-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #000;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #000;
-}
-
-.video-container:fullscreen .video-canvas,
-.video-container:-webkit-full-screen .video-canvas {
-  width: auto;
-  height: auto;
-  max-width: 100vw;
-  max-height: 100vh;
   border-radius: 0;
 }
 
-.video-container:fullscreen .fullscreen-btn,
-.video-container:-webkit-full-screen .fullscreen-btn {
+.video-container.is-fullscreen .video-canvas {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 0;
+}
+
+.video-container.is-fullscreen .fullscreen-btn {
   position: fixed;
   top: 16px;
   right: 16px;
-  z-index: 10;
-  opacity: 0;
-}
-
-.video-container:fullscreen:hover .fullscreen-btn,
-.video-container:-webkit-full-screen:hover .fullscreen-btn {
-  opacity: 1;
+  z-index: 10000;
+  opacity: 0.7;
 }
 
 .stream-status {

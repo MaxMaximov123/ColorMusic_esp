@@ -29,8 +29,9 @@ const threshold = computed(() => state.value.threshold ?? 0)
 const notify = computed(() => !!(state.value.notify))
 const online = computed(() => props.device.online)
 
-// Threshold input
 const thresholdInput = ref(threshold.value)
+const chartFullscreen = ref(false)
+const chartCardRef = ref(null)
 
 watch(threshold, (val) => {
   thresholdInput.value = val
@@ -72,55 +73,40 @@ const chartData = computed(() => {
 
   const temps = historyData.value.map(p => p.temperature)
 
-  const datasets = [
-    {
-      label: 'Температура',
-      data: temps,
-      borderColor: '#2ee8b7',
-      backgroundColor: 'rgba(46, 232, 183, 0.1)',
-      fill: true,
-      tension: 0.4,
-      pointRadius: 0,
-      pointHitRadius: 10,
-      borderWidth: 2
-    }
-  ]
-
-  // Threshold line
-  if (threshold.value != null && temps.length > 0) {
-    datasets.push({
-      label: 'Порог',
-      data: Array(labels.length).fill(threshold.value),
-      borderColor: '#f44336',
-      borderDash: [6, 4],
-      borderWidth: 1.5,
-      pointRadius: 0,
-      fill: false
-    })
+  return {
+    labels,
+    datasets: [
+      {
+        label: 'Температура',
+        data: temps,
+        borderColor: '#2ee8b7',
+        backgroundColor: 'rgba(46, 232, 183, 0.1)',
+        fill: true,
+        tension: 0.4,
+        pointRadius: 0,
+        pointHitRadius: 10,
+        borderWidth: 2
+      }
+    ]
   }
-
-  return { labels, datasets }
 })
 
 const chartOptions = computed(() => ({
   responsive: true,
   maintainAspectRatio: false,
   plugins: {
-    legend: {
-      display: true,
-      labels: { color: '#aaa', boxWidth: 12, font: { size: 11 } }
-    },
+    legend: { display: false },
     tooltip: {
       mode: 'index',
       intersect: false,
       callbacks: {
-        label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}°C`
+        label: (ctx) => `${ctx.parsed.y.toFixed(1)}°C`
       }
     }
   },
   scales: {
     x: {
-      ticks: { color: '#666', maxTicksLimit: 8, font: { size: 10 } },
+      ticks: { color: '#666', maxTicksLimit: chartFullscreen.value ? 16 : 8, font: { size: 10 } },
       grid: { color: 'rgba(255,255,255,0.05)' }
     },
     y: {
@@ -155,6 +141,35 @@ watch(selectedHours, () => {
   loadHistory()
 })
 
+function onFullscreenChange() {
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+    chartFullscreen.value = false
+    document.body.style.overflow = ''
+    try { screen.orientation.unlock() } catch {}
+  }
+}
+
+function toggleChartFullscreen() {
+  if (chartFullscreen.value) {
+    chartFullscreen.value = false
+    document.body.style.overflow = ''
+    try {
+      if (document.fullscreenElement) document.exitFullscreen()
+      else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
+    } catch {}
+    try { screen.orientation.unlock() } catch {}
+  } else {
+    chartFullscreen.value = true
+    document.body.style.overflow = 'hidden'
+    const el = chartCardRef.value?.$el || chartCardRef.value
+    try {
+      if (el?.requestFullscreen) el.requestFullscreen()
+      else if (el?.webkitRequestFullscreen) el.webkitRequestFullscreen()
+    } catch {}
+    try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
+  }
+}
+
 function startAutoRefresh() {
   stopAutoRefresh()
   refreshTimer = setInterval(loadHistory, 60000)
@@ -170,10 +185,19 @@ function stopAutoRefresh() {
 onMounted(() => {
   loadHistory()
   startAutoRefresh()
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+  document.addEventListener('webkitfullscreenchange', onFullscreenChange)
 })
 
 onUnmounted(() => {
   stopAutoRefresh()
+  if (chartFullscreen.value) {
+    chartFullscreen.value = false
+    document.body.style.overflow = ''
+    try { screen.orientation.unlock() } catch {}
+  }
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
+  document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
 })
 </script>
 
@@ -245,9 +269,23 @@ onUnmounted(() => {
     </q-card>
 
     <!-- Temperature chart -->
-    <q-card dark class="section-card q-mb-sm">
-      <q-card-section class="q-pa-sm">
-        <div class="section-title">История температуры</div>
+    <q-card
+      ref="chartCardRef"
+      dark
+      class="section-card q-mb-sm"
+      :class="{ 'chart-fullscreen': chartFullscreen }"
+    >
+      <q-card-section class="q-pa-sm chart-section">
+        <div class="row items-center justify-between q-mb-xs">
+          <div class="section-title" style="margin-bottom: 0;">История температуры</div>
+          <q-btn
+            flat round dense
+            :icon="chartFullscreen ? 'fullscreen_exit' : 'fullscreen'"
+            size="sm"
+            color="grey-5"
+            @click="toggleChartFullscreen"
+          />
+        </div>
 
         <q-btn-toggle
           v-model="selectedHours"
@@ -258,7 +296,7 @@ onUnmounted(() => {
           toggle-text-color="dark"
           no-caps
           spread
-          class="q-mb-md"
+          class="q-mb-sm"
           dense
         />
 
@@ -268,6 +306,7 @@ onUnmounted(() => {
             v-if="chartData.labels.length > 0"
             :data="chartData"
             :options="chartOptions"
+            :key="chartFullscreen ? 'fs' : 'normal'"
           />
           <div v-else-if="!chartLoading" class="text-center text-grey-6 q-pa-lg">
             Нет данных
@@ -344,5 +383,26 @@ onUnmounted(() => {
 
 .chart-loading {
   opacity: 0.5;
+}
+
+/* Chart fullscreen */
+.chart-fullscreen {
+  position: fixed !important;
+  inset: 0;
+  z-index: 9999;
+  border-radius: 0 !important;
+  margin: 0 !important;
+}
+
+.chart-fullscreen .chart-section {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-fullscreen .chart-container {
+  flex: 1;
+  height: auto !important;
+  min-height: 0;
 }
 </style>

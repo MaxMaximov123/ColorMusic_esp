@@ -76,6 +76,16 @@ async function initDB() {
     });
   }
 
+  if (!(await db.schema.hasTable('ipeye_credentials'))) {
+    await db.schema.createTable('ipeye_credentials', t => {
+      t.integer('user_id').primary()
+        .references('id').inTable('users').onDelete('CASCADE');
+      t.string('ipeye_login', 255).notNullable();
+      t.string('ipeye_password', 255).notNullable();
+      t.timestamp('updated_at').defaultTo(db.fn.now());
+    });
+  }
+
   const admin = await db('users').where('username', ADMIN_USER).first();
   if (!admin) {
     const hash = await bcrypt.hash(ADMIN_PASS, 10);
@@ -140,6 +150,77 @@ app.get('/api/temperature/:deviceId', authMiddleware, async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error('[temp-history]', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── IPeye credentials ──
+
+function callDetectorLogin(login, password) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ login, password });
+    const req = http.request({
+      hostname: DETECTOR_HOST,
+      port: parseInt(DETECTOR_PORT),
+      path: '/api/login',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
+        catch { reject(new Error('Invalid detector response')); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => req.destroy(new Error('timeout')));
+    req.write(body);
+    req.end();
+  });
+}
+
+app.get('/api/ipeye/connect', authMiddleware, async (req, res) => {
+  try {
+    const cred = await db('ipeye_credentials').where('user_id', req.user.id).first();
+    if (!cred) return res.json({ saved: false });
+
+    const result = await callDetectorLogin(cred.ipeye_login, cred.ipeye_password);
+    if (result.status === 200) {
+      res.json(result.data);
+    } else {
+      res.json({ saved: true, error: result.data.error || 'IPeye auth failed' });
+    }
+  } catch (err) {
+    console.error('[ipeye-connect]', err.message);
+    res.json({ saved: false, error: 'Сервис видеонаблюдения недоступен' });
+  }
+});
+
+app.post('/api/ipeye/save', authMiddleware, async (req, res) => {
+  const { login, password } = req.body || {};
+  if (!login || !password) return res.status(400).json({ error: 'Credentials required' });
+  try {
+    await db('ipeye_credentials')
+      .insert({ user_id: req.user.id, ipeye_login: login, ipeye_password: password, updated_at: db.fn.now() })
+      .onConflict('user_id')
+      .merge({ ipeye_login: login, ipeye_password: password, updated_at: db.fn.now() });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ipeye-save]', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/ipeye/forget', authMiddleware, async (req, res) => {
+  try {
+    await db('ipeye_credentials').where('user_id', req.user.id).delete();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ipeye-forget]', err.message);
     res.status(500).json({ error: 'Server error' });
   }
 });
