@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { Line } from 'vue-chartjs'
 import {
   Chart as ChartJS,
@@ -8,19 +8,16 @@ import {
   LinearScale,
   CategoryScale,
   Filler,
-  Tooltip,
-  Legend
+  Tooltip
 } from 'chart.js'
 import { useApi } from '../composables/useApi.js'
 
-ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Filler, Tooltip, Legend)
+ChartJS.register(LineElement, PointElement, LinearScale, CategoryScale, Filler, Tooltip)
 
 const props = defineProps({
   device: { type: Object, required: true }
 })
-
 const emit = defineEmits(['command'])
-
 const { fetchTemperatureHistory } = useApi()
 
 const state = computed(() => props.device.state || {})
@@ -31,24 +28,19 @@ const online = computed(() => props.device.online)
 
 const thresholdInput = ref(threshold.value)
 const chartFullscreen = ref(false)
-const chartCardRef = ref(null)
+const chartWrapRef = ref(null)
 
-watch(threshold, (val) => {
-  thresholdInput.value = val
-})
+watch(threshold, (val) => { thresholdInput.value = val })
 
 function onThresholdChange(val) {
   const num = parseFloat(val)
-  if (!isNaN(num)) {
-    emit('command', { threshold: num })
-  }
+  if (!isNaN(num)) emit('command', { threshold: num })
 }
 
 function onNotifyToggle(val) {
   emit('command', { notify: val ? 1 : 0 })
 }
 
-// Chart
 const hoursOptions = [
   { label: '6ч', value: 6 },
   { label: '24ч', value: 24 },
@@ -58,7 +50,6 @@ const hoursOptions = [
 const selectedHours = ref(24)
 const historyData = ref([])
 const chartLoading = ref(false)
-
 let refreshTimer = null
 
 const chartData = computed(() => {
@@ -70,66 +61,50 @@ const chartData = computed(() => {
     return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }) + ' ' +
            d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
   })
-
-  const temps = historyData.value.map(p => p.temperature)
-
   return {
     labels,
-    datasets: [
-      {
-        label: 'Температура',
-        data: temps,
-        borderColor: '#2ee8b7',
-        backgroundColor: 'rgba(46, 232, 183, 0.1)',
-        fill: true,
-        tension: 0.4,
-        pointRadius: 0,
-        pointHitRadius: 10,
-        borderWidth: 2
-      }
-    ]
+    datasets: [{
+      label: 'Температура',
+      data: historyData.value.map(p => p.temperature),
+      borderColor: '#2ee8b7',
+      backgroundColor: 'rgba(46, 232, 183, 0.1)',
+      fill: true,
+      tension: 0.4,
+      pointRadius: 0,
+      pointHitRadius: 10,
+      borderWidth: 2
+    }]
   }
 })
 
 const chartOptions = computed(() => ({
   responsive: true,
   maintainAspectRatio: false,
+  animation: false,
   plugins: {
     legend: { display: false },
     tooltip: {
-      mode: 'index',
-      intersect: false,
-      callbacks: {
-        label: (ctx) => `${ctx.parsed.y.toFixed(1)}°C`
-      }
+      mode: 'index', intersect: false,
+      callbacks: { label: (ctx) => `${ctx.parsed.y.toFixed(1)}°C` }
     }
   },
   scales: {
     x: {
-      ticks: { color: '#666', maxTicksLimit: chartFullscreen.value ? 16 : 8, font: { size: 10 } },
-      grid: { color: 'rgba(255,255,255,0.05)' }
+      ticks: { color: '#888', maxTicksLimit: chartFullscreen.value ? 16 : 8, font: { size: chartFullscreen.value ? 12 : 10 } },
+      grid: { color: 'rgba(255,255,255,0.06)' }
     },
     y: {
-      ticks: {
-        color: '#666',
-        font: { size: 11 },
-        callback: (v) => v + '°C'
-      },
-      grid: { color: 'rgba(255,255,255,0.05)' }
+      ticks: { color: '#888', font: { size: chartFullscreen.value ? 13 : 11 }, callback: (v) => v + '°C' },
+      grid: { color: 'rgba(255,255,255,0.06)' }
     }
   },
-  interaction: {
-    mode: 'nearest',
-    axis: 'x',
-    intersect: false
-  }
+  interaction: { mode: 'nearest', axis: 'x', intersect: false }
 }))
 
 async function loadHistory() {
   chartLoading.value = true
   try {
-    const data = await fetchTemperatureHistory(props.device.id, selectedHours.value)
-    historyData.value = data
+    historyData.value = await fetchTemperatureHistory(props.device.id, selectedHours.value)
   } catch (e) {
     console.error('Failed to load temperature history:', e)
   } finally {
@@ -137,9 +112,7 @@ async function loadHistory() {
   }
 }
 
-watch(selectedHours, () => {
-  loadHistory()
-})
+watch(selectedHours, () => loadHistory())
 
 function onFullscreenChange() {
   if (!document.fullscreenElement && !document.webkitFullscreenElement) {
@@ -149,53 +122,45 @@ function onFullscreenChange() {
   }
 }
 
+async function enterChartFullscreen() {
+  chartFullscreen.value = true
+  document.body.style.overflow = 'hidden'
+  await nextTick()
+  const el = chartWrapRef.value
+  if (el) {
+    try {
+      if (el.requestFullscreen) el.requestFullscreen()
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen()
+    } catch {}
+  }
+  try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
+}
+
+function exitChartFullscreen() {
+  chartFullscreen.value = false
+  document.body.style.overflow = ''
+  try {
+    if (document.fullscreenElement) document.exitFullscreen()
+    else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
+  } catch {}
+  try { screen.orientation.unlock() } catch {}
+}
+
 function toggleChartFullscreen() {
-  if (chartFullscreen.value) {
-    chartFullscreen.value = false
-    document.body.style.overflow = ''
-    try {
-      if (document.fullscreenElement) document.exitFullscreen()
-      else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
-    } catch {}
-    try { screen.orientation.unlock() } catch {}
-  } else {
-    chartFullscreen.value = true
-    document.body.style.overflow = 'hidden'
-    const el = chartCardRef.value?.$el || chartCardRef.value
-    try {
-      if (el?.requestFullscreen) el.requestFullscreen()
-      else if (el?.webkitRequestFullscreen) el.webkitRequestFullscreen()
-    } catch {}
-    try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
-  }
-}
-
-function startAutoRefresh() {
-  stopAutoRefresh()
-  refreshTimer = setInterval(loadHistory, 60000)
-}
-
-function stopAutoRefresh() {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-    refreshTimer = null
-  }
+  if (chartFullscreen.value) exitChartFullscreen()
+  else enterChartFullscreen()
 }
 
 onMounted(() => {
   loadHistory()
-  startAutoRefresh()
+  refreshTimer = setInterval(loadHistory, 60000)
   document.addEventListener('fullscreenchange', onFullscreenChange)
   document.addEventListener('webkitfullscreenchange', onFullscreenChange)
 })
 
 onUnmounted(() => {
-  stopAutoRefresh()
-  if (chartFullscreen.value) {
-    chartFullscreen.value = false
-    document.body.style.overflow = ''
-    try { screen.orientation.unlock() } catch {}
-  }
+  if (refreshTimer) clearInterval(refreshTimer)
+  if (chartFullscreen.value) exitChartFullscreen()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
 })
@@ -217,10 +182,7 @@ onUnmounted(() => {
           </template>
         </div>
         <div class="q-mt-sm">
-          <q-badge
-            :color="online ? 'green' : 'red'"
-            :label="online ? 'В сети' : 'Не в сети'"
-          />
+          <q-badge :color="online ? 'green' : 'red'" :label="online ? 'В сети' : 'Не в сети'" />
         </div>
       </q-card-section>
     </q-card>
@@ -230,26 +192,8 @@ onUnmounted(() => {
       <q-card-section class="q-pa-sm">
         <div class="section-title">Порог уведомления</div>
         <div class="threshold-row">
-          <q-slider
-            v-model="thresholdInput"
-            :min="-10" :max="30" :step="0.5"
-            color="primary"
-            label
-            :label-value="thresholdInput + '°C'"
-            class="q-mr-md"
-            style="flex: 1;"
-            @change="onThresholdChange"
-          />
-          <q-input
-            v-model.number="thresholdInput"
-            type="number"
-            filled
-            dense
-            dark
-            style="width: 80px;"
-            :step="0.5"
-            @change="onThresholdChange(thresholdInput)"
-          />
+          <q-slider v-model="thresholdInput" :min="-10" :max="30" :step="0.5" color="primary" label :label-value="thresholdInput + '°C'" class="q-mr-md" style="flex:1;" @change="onThresholdChange" />
+          <q-input v-model.number="thresholdInput" type="number" filled dense dark style="width:80px;" :step="0.5" @change="onThresholdChange(thresholdInput)" />
         </div>
       </q-card-section>
     </q-card>
@@ -259,150 +203,98 @@ onUnmounted(() => {
       <q-card-section class="q-pa-sm">
         <div class="notify-row">
           <span class="notify-label">Уведомления в Telegram</span>
-          <q-toggle
-            :model-value="notify"
-            color="primary"
-            @update:model-value="onNotifyToggle"
-          />
+          <q-toggle :model-value="notify" color="primary" @update:model-value="onNotifyToggle" />
         </div>
       </q-card-section>
     </q-card>
 
     <!-- Temperature chart -->
-    <q-card
-      ref="chartCardRef"
-      dark
-      class="section-card q-mb-sm"
-      :class="{ 'chart-fullscreen': chartFullscreen }"
-    >
-      <q-card-section class="q-pa-sm chart-section">
+    <q-card dark class="section-card q-mb-sm">
+      <q-card-section class="q-pa-sm">
         <div class="row items-center justify-between q-mb-xs">
-          <div class="section-title" style="margin-bottom: 0;">История температуры</div>
-          <q-btn
-            flat round dense
-            :icon="chartFullscreen ? 'fullscreen_exit' : 'fullscreen'"
-            size="sm"
-            color="grey-5"
-            @click="toggleChartFullscreen"
-          />
+          <div class="section-title" style="margin-bottom:0;">История температуры</div>
+          <q-btn flat round dense icon="fullscreen" size="sm" color="grey-5" @click="enterChartFullscreen" />
         </div>
 
         <q-btn-toggle
-          v-model="selectedHours"
-          :options="hoursOptions"
-          color="grey-8"
-          text-color="grey-4"
-          toggle-color="primary"
-          toggle-text-color="dark"
-          no-caps
-          spread
-          class="q-mb-sm"
-          dense
+          v-model="selectedHours" :options="hoursOptions"
+          color="grey-8" text-color="grey-4" toggle-color="primary" toggle-text-color="dark"
+          no-caps spread class="q-mb-sm" dense
         />
 
         <div class="chart-container" :class="{ 'chart-loading': chartLoading }">
           <q-inner-loading :showing="chartLoading" color="primary" />
-          <Line
-            v-if="chartData.labels.length > 0"
-            :data="chartData"
-            :options="chartOptions"
-            :key="chartFullscreen ? 'fs' : 'normal'"
-          />
-          <div v-else-if="!chartLoading" class="text-center text-grey-6 q-pa-lg">
-            Нет данных
-          </div>
+          <Line v-if="chartData.labels.length > 0" :data="chartData" :options="chartOptions" />
+          <div v-else-if="!chartLoading" class="text-center text-grey-6 q-pa-lg">Нет данных</div>
         </div>
       </q-card-section>
     </q-card>
+
+    <!-- Chart fullscreen overlay — only chart + close button -->
+    <div v-if="chartFullscreen" ref="chartWrapRef" class="chart-fs-overlay">
+      <div class="chart-fs-inner">
+        <Line
+          v-if="chartData.labels.length > 0"
+          :data="chartData"
+          :options="chartOptions"
+          :key="'fs'"
+        />
+        <div v-else class="text-center text-grey-6" style="margin:auto;">Нет данных</div>
+      </div>
+      <q-btn
+        flat round icon="close" size="md"
+        class="chart-fs-close"
+        @click="exitChartFullscreen"
+      />
+    </div>
   </div>
 </template>
 
 <style scoped>
-.section-card {
-  background: #1a1a2e !important;
-  border-radius: 8px;
-}
-
+.section-card { background: #1a1a2e !important; border-radius: 8px; }
 .section-title {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: #aaa;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: 10px;
+  font-size: 0.85rem; font-weight: 600; color: #aaa;
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
 }
 
-.temp-display {
-  display: inline-flex;
-  align-items: baseline;
-}
+.temp-display { display: inline-flex; align-items: baseline; }
+.temp-display.offline { opacity: 0.4; }
+.temp-value { font-size: 4rem; font-weight: 700; color: #2ee8b7; line-height: 1; }
+.temp-value.temp-na { color: #666; }
+.temp-unit { font-size: 2rem; font-weight: 400; color: #888; margin-left: 4px; }
 
-.temp-display.offline {
-  opacity: 0.4;
-}
+.threshold-row { display: flex; align-items: center; }
+.notify-row { display: flex; align-items: center; justify-content: space-between; }
+.notify-label { font-size: 0.9rem; color: #ccc; }
 
-.temp-value {
-  font-size: 4rem;
-  font-weight: 700;
-  color: #2ee8b7;
-  line-height: 1;
-}
+.chart-container { position: relative; height: 250px; min-height: 200px; }
+.chart-loading { opacity: 0.5; }
 
-.temp-value.temp-na {
-  color: #666;
-}
-
-.temp-unit {
-  font-size: 2rem;
-  font-weight: 400;
-  color: #888;
-  margin-left: 4px;
-}
-
-.threshold-row {
-  display: flex;
-  align-items: center;
-}
-
-.notify-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.notify-label {
-  font-size: 0.9rem;
-  color: #ccc;
-}
-
-.chart-container {
-  position: relative;
-  height: 250px;
-  min-height: 200px;
-}
-
-.chart-loading {
-  opacity: 0.5;
-}
-
-/* Chart fullscreen */
-.chart-fullscreen {
-  position: fixed !important;
+/* Chart fullscreen — clean overlay, only chart + close */
+.chart-fs-overlay {
+  position: fixed;
   inset: 0;
   z-index: 9999;
-  border-radius: 0 !important;
-  margin: 0 !important;
-}
-
-.chart-fullscreen .chart-section {
-  height: 100%;
+  background: #111;
   display: flex;
-  flex-direction: column;
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 12px;
 }
 
-.chart-fullscreen .chart-container {
+.chart-fs-inner {
   flex: 1;
-  height: auto !important;
+  position: relative;
+  min-width: 0;
   min-height: 0;
+}
+
+.chart-fs-close {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 10000;
+  background: rgba(255,255,255,0.12) !important;
+  color: white !important;
 }
 </style>

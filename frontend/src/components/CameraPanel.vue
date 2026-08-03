@@ -112,11 +112,8 @@ async function doIpeyeLogin() {
 }
 
 function toggleStream() {
-  if (streaming.value) {
-    stopStream()
-  } else {
-    startStream()
-  }
+  if (streaming.value) stopStream()
+  else startStream()
 }
 
 function startStream() {
@@ -143,36 +140,21 @@ function startStream() {
     if (typeof event.data === 'string') {
       try {
         const msg = JSON.parse(event.data)
-        if (msg.status) {
-          streamStatus.value = msg.status === 'connecting' ? 'Подключение к камере...' : msg.status
-        }
-        if (msg.error) {
-          streamError.value = msg.error
-          streamStatus.value = ''
-        }
-      } catch (e) { /* ignore */ }
+        if (msg.status) streamStatus.value = msg.status === 'connecting' ? 'Подключение к камере...' : msg.status
+        if (msg.error) { streamError.value = msg.error; streamStatus.value = '' }
+      } catch {}
     } else {
       streamStatus.value = ''
       renderFrame(event.data)
     }
   }
 
-  ws.onclose = () => {
-    streaming.value = false
-    streamStatus.value = ''
-  }
-
-  ws.onerror = () => {
-    streamError.value = 'Ошибка соединения'
-    streaming.value = false
-  }
+  ws.onclose = () => { streaming.value = false; streamStatus.value = '' }
+  ws.onerror = () => { streamError.value = 'Ошибка соединения'; streaming.value = false }
 }
 
 function stopStream() {
-  if (ws) {
-    ws.close()
-    ws = null
-  }
+  if (ws) { ws.close(); ws = null }
   streaming.value = false
   streamStatus.value = ''
 }
@@ -180,7 +162,6 @@ function stopStream() {
 function renderFrame(blob) {
   const canvas = canvasRef.value
   if (!canvas) return
-
   const url = URL.createObjectURL(new Blob([blob], { type: 'image/jpeg' }))
   const img = new Image()
   img.onload = () => {
@@ -235,90 +216,42 @@ function doIpeyeLogout() {
 
 <template>
   <div class="camera-panel">
-    <!-- Loading -->
     <div v-if="autoConnecting" class="text-center q-pa-xl">
       <q-spinner color="primary" size="2em" />
       <div class="q-mt-sm text-grey-6 text-caption">Подключение к камерам...</div>
     </div>
 
-    <!-- IPeye Auth -->
     <q-card v-else-if="!ipeyeSession" dark class="section-card q-mb-sm">
       <q-card-section>
         <div class="section-title">Видеонаблюдение — Авторизация</div>
-        <q-input
-          v-model="ipeyeLogin"
-          filled dense dark
-          label="Логин IPeye"
-          class="q-mb-sm"
-        />
-        <q-input
-          v-model="ipeyePassword"
-          filled dense dark
-          label="Пароль"
-          type="password"
-          class="q-mb-sm"
-        />
-        <q-btn
-          label="Подключить"
-          color="primary"
-          no-caps
-          :loading="loginLoading"
-          @click="doIpeyeLogin"
-        />
-        <div v-if="loginError" class="text-negative q-mt-sm text-caption">
-          {{ loginError }}
-        </div>
+        <q-input v-model="ipeyeLogin" filled dense dark label="Логин IPeye" class="q-mb-sm" />
+        <q-input v-model="ipeyePassword" filled dense dark label="Пароль" type="password" class="q-mb-sm" />
+        <q-btn label="Подключить" color="primary" no-caps :loading="loginLoading" @click="doIpeyeLogin" />
+        <div v-if="loginError" class="text-negative q-mt-sm text-caption">{{ loginError }}</div>
       </q-card-section>
     </q-card>
 
-    <!-- Controls -->
     <template v-if="ipeyeSession">
       <q-card dark class="section-card q-mb-sm">
         <q-card-section class="q-pa-sm">
           <div class="row items-center justify-between q-mb-sm">
             <div class="section-title" style="margin-bottom: 0;">Камеры</div>
-            <q-btn
-              flat dense size="sm" color="grey-5"
-              icon="logout"
-              title="Отключить и забыть учётные данные"
-              @click="doIpeyeLogout"
-            />
+            <q-btn flat dense size="sm" color="grey-5" icon="logout" title="Забыть учётные данные" @click="doIpeyeLogout" />
           </div>
-
-          <q-select
-            v-model="selectedCamera"
-            :options="cameraOptions"
-            emit-value
-            map-options
-            filled dense dark
-            label="Камера"
-            class="q-mb-sm"
-            :disable="streaming"
-          />
-
+          <q-select v-model="selectedCamera" :options="cameraOptions" emit-value map-options filled dense dark label="Камера" class="q-mb-sm" :disable="streaming" />
           <div class="row items-center justify-end">
-            <q-btn
-              :label="streaming ? 'Остановить' : 'Смотреть'"
-              :color="streaming ? 'negative' : 'primary'"
-              :icon="streaming ? 'stop' : 'play_arrow'"
-              no-caps
-              @click="toggleStream"
-              :disable="!selectedCamera"
-            />
+            <q-btn :label="streaming ? 'Остановить' : 'Смотреть'" :color="streaming ? 'negative' : 'primary'" :icon="streaming ? 'stop' : 'play_arrow'" no-caps @click="toggleStream" :disable="!selectedCamera" />
           </div>
         </q-card-section>
       </q-card>
 
-      <!-- Video -->
       <q-card v-if="streaming || streamError" dark class="section-card">
         <q-card-section class="q-pa-none">
           <div v-if="streamStatus" class="stream-status text-center q-pa-lg">
             <q-spinner color="primary" size="2em" class="q-mr-sm" />
             {{ streamStatus }}
           </div>
-          <div v-if="streamError" class="text-negative text-center q-pa-md text-caption">
-            {{ streamError }}
-          </div>
+          <div v-if="streamError" class="text-negative text-center q-pa-md text-caption">{{ streamError }}</div>
           <div
             ref="videoContainerRef"
             class="video-container"
@@ -326,9 +259,11 @@ function doIpeyeLogout() {
           >
             <canvas ref="canvasRef" class="video-canvas" />
             <q-btn
-              flat round dense
-              :icon="isFullscreen ? 'fullscreen_exit' : 'fullscreen'"
-              class="fullscreen-btn"
+              flat round
+              :icon="isFullscreen ? 'close' : 'fullscreen'"
+              :size="isFullscreen ? 'md' : 'sm'"
+              class="fs-btn"
+              :class="{ 'fs-btn-exit': isFullscreen }"
               @click="toggleFullscreen"
             />
           </div>
@@ -343,14 +278,9 @@ function doIpeyeLogout() {
   background: #1a1a2e !important;
   border-radius: 8px;
 }
-
 .section-title {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: #aaa;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: 10px;
+  font-size: 0.85rem; font-weight: 600; color: #aaa;
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;
 }
 
 .video-container {
@@ -359,67 +289,43 @@ function doIpeyeLogout() {
   border-radius: 0 0 8px 8px;
   line-height: 0;
 }
-
 .video-canvas {
-  display: block;
-  width: 100%;
-  height: auto;
+  display: block; width: 100%; height: auto;
   border-radius: 0 0 8px 8px;
 }
+.video-container.hidden { display: none; }
 
-.video-container.hidden {
-  display: none;
-}
-
-.fullscreen-btn {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  background: rgba(0, 0, 0, 0.5) !important;
+/* Fullscreen enter button */
+.fs-btn {
+  position: absolute; top: 8px; right: 8px;
+  background: rgba(0,0,0,0.5) !important;
   color: white !important;
-  opacity: 0;
-  transition: opacity 0.2s;
+  opacity: 0; transition: opacity 0.2s;
 }
+.video-container:hover .fs-btn { opacity: 1; }
+@media (pointer: coarse) { .fs-btn { opacity: 0.7 !important; } }
 
-.video-container:hover .fullscreen-btn {
-  opacity: 1;
-}
-
-@media (pointer: coarse) {
-  .fullscreen-btn {
-    opacity: 0.7 !important;
-  }
-}
-
+/* Fullscreen mode */
 .video-container.is-fullscreen {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
+  position: fixed; inset: 0; z-index: 9999;
   background: #000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: flex; align-items: center; justify-content: center;
   border-radius: 0;
 }
-
 .video-container.is-fullscreen .video-canvas {
-  width: auto;
-  height: auto;
-  max-width: 100%;
-  max-height: 100%;
+  width: auto; height: auto;
+  max-width: 100%; max-height: 100%;
   border-radius: 0;
 }
 
-.video-container.is-fullscreen .fullscreen-btn {
-  position: fixed;
-  top: 16px;
-  right: 16px;
+/* Exit button — always visible in fullscreen */
+.fs-btn-exit {
+  position: fixed !important;
+  top: 16px; right: 16px;
   z-index: 10000;
-  opacity: 0.7;
+  opacity: 1 !important;
+  background: rgba(0,0,0,0.6) !important;
 }
 
-.stream-status {
-  color: #aaa;
-  font-size: 0.9rem;
-}
+.stream-status { color: #aaa; font-size: 0.9rem; }
 </style>
