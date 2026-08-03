@@ -8,9 +8,9 @@ import asyncio
 import json
 import logging
 import os
-import struct
 import subprocess
 import threading
+import time
 import uuid
 from collections import deque
 from typing import Optional
@@ -30,55 +30,78 @@ MODELS_DIR = os.environ.get("MODELS_DIR", "/models")
 YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
 YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.25"))
 
-VALID_BOXES = {b"ftyp", b"styp", b"moov", b"moof", b"mdat", b"sidx", b"free", b"skip", b"mfra"}
+ORIGIN = "https://www.ipeye.ru"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 YaBrowser/26.4.0.0 Safari/537.36"
+)
+
+VALID_BOXES = {b"ftyp", b"styp", b"moov", b"moof", b"mdat",
+               b"sidx", b"free", b"skip", b"mfra"}
 
 COLORS = [
-    (46, 232, 183), (255, 107, 107), (78, 205, 196), (255, 230, 109),
-    (162, 155, 254), (253, 150, 68), (0, 210, 211), (232, 67, 147),
+    (76, 175, 80), (33, 150, 243), (255, 152, 0), (156, 39, 176),
+    (244, 67, 54), (0, 188, 212), (255, 235, 59), (121, 85, 72),
 ]
 
 
-# ── IPeye Client ──
+# ── IPeye Client (порт из оригинала 1:1) ──
 
 class IpeyeClient:
     BASE_URL = "https://www.ipeye.ru/ipeye_service/index.php"
     SITE_URL = "https://www.ipeye.ru"
     API_URL = "https://api.ipeye.ru"
 
-    UA = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    )
-
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": self.UA})
-        self.cameras: list[dict] = []
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "ru",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
+        self.logged_in = False
 
     def login(self, login: str, password: str) -> bool:
         try:
-            self.session.get(self.SITE_URL, timeout=10)
+            self.session.get(
+                self.SITE_URL + "/",
+                headers={"Accept": "text/html"},
+                timeout=15,
+            )
+            logger.info(f"PHPSESSID: {self.session.cookies.get('PHPSESSID', '?')[:12]}...")
 
             resp = self.session.post(
                 f"{self.BASE_URL}?route=proc_login",
                 data={
+                    "service_url_relative": "ipeye_service/",
                     "login": login,
                     "pass": password,
                     "captcha": "false",
-                    "service_url_relative": "ipeye_service/",
                 },
                 headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Referer": self.SITE_URL + "/",
                     "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{self.SITE_URL}/ipeye_service/?route=page_login",
-                    "Origin": self.SITE_URL,
+                    "Origin": ORIGIN,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                 },
                 timeout=15,
             )
+            logger.info(f"Login response: {resp.status_code}, body={resp.text[:200]}")
             if resp.status_code != 200:
                 return False
 
-            resp = self.session.get(f"{self.BASE_URL}?route=page_index", timeout=10)
-            return resp.status_code == 200
+            idx_resp = self.session.get(
+                f"{self.BASE_URL}?route=page_index",
+                headers={"Accept": "text/html", "Referer": self.SITE_URL + "/"},
+                timeout=15,
+            )
+            logger.info(f"page_index: {idx_resp.status_code}, cookies: {list(self.session.cookies.keys())}")
+
+            self.logged_in = True
+            return True
         except Exception as e:
             logger.error(f"IPeye login error: {e}")
             return False
@@ -128,15 +151,16 @@ class IpeyeClient:
                 cameras.append({
                     "id": item.get("devcode", ""),
                     "name": item.get("device_name", ""),
-                    "server": item.get("storage_server", ""),
+                    "storage_server": item.get("storage_server", ""),
                 })
+            logger.info(f"Found {len(cameras)} cameras")
             self.cameras = cameras
             return cameras
         except Exception as e:
             logger.error(f"IPeye get_cameras error: {e}")
             return []
 
-    def get_stream_info(self, device_ids: list[str]) -> dict:
+    def get_stream_status(self, device_ids: list[str]) -> dict:
         try:
             resp = self.session.post(
                 f"{self.API_URL}/v1/stream/status_array_full",
@@ -145,28 +169,40 @@ class IpeyeClient:
                     "Accept": "*/*",
                     "Referer": f"{self.BASE_URL}?route=page_index",
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Origin": self.SITE_URL,
+                    "Origin": ORIGIN,
                 },
                 timeout=10,
             )
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                for did, info in data.items():
+                    logger.info(f"Stream {did[:12]}... status={info.get('status','?')}, "
+                                f"{info.get('Width','?')}x{info.get('Height','?')}")
+                return data
         except Exception as e:
-            logger.error(f"IPeye stream_info error: {e}")
+            logger.error(f"IPeye stream_status error: {e}")
         return {}
 
-    def authorize_stream(self, device_id: str) -> dict:
+    def authorize_stream(self, device_id: str) -> Optional[str]:
         try:
             resp = self.session.get(
                 f"{self.BASE_URL}?route=page_play_ajax&new_websocket&devid={device_id}",
-                headers={"X-Requested-With": "XMLHttpRequest"},
+                headers={
+                    "Accept": "*/*",
+                    "Referer": f"{self.BASE_URL}?route=page_play&devcode={device_id}",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
                 timeout=10,
             )
+            logger.info(f"authorize_stream {device_id[:12]}... -> {resp.status_code}")
+            logger.info(f"authorize_stream body: {resp.text[:300]}")
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                server = data.get("server", "")
+                return server if server else None
         except Exception as e:
             logger.error(f"IPeye authorize error: {e}")
-        return {}
+        return None
 
 
 # ── YOLO Detector ──
@@ -179,7 +215,7 @@ class YoloDetector:
         self.model.fuse()
 
         import torch
-        if torch.backends.mps.is_available():
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             self.device = "mps"
         elif torch.cuda.is_available():
             self.device = "cuda"
@@ -188,7 +224,9 @@ class YoloDetector:
         logger.info(f"YOLO device: {self.device}")
 
         dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-        self.model.predict(dummy, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, device=self.device, verbose=False)
+        self.model.predict(dummy, imgsz=YOLO_IMGSZ, conf=YOLO_CONF,
+                           device=self.device, half=(self.device == "mps"),
+                           verbose=False)
 
         self._queue: deque = deque(maxlen=1)
         self._event = threading.Event()
@@ -220,43 +258,51 @@ class YoloDetector:
 
     def _loop(self):
         while self._running:
-            self._event.wait(timeout=1.0)
+            self._event.wait(timeout=0.5)
             self._event.clear()
             if not self._queue:
                 continue
-            frame = self._queue.pop()
+            try:
+                frame = self._queue.pop()
+            except IndexError:
+                continue
             try:
                 results = self.model.predict(
-                    frame, imgsz=YOLO_IMGSZ, conf=YOLO_CONF,
-                    device=self.device, verbose=False,
+                    frame, verbose=False, stream=True, imgsz=YOLO_IMGSZ,
+                    conf=YOLO_CONF, device=self.device,
+                    half=(self.device == "mps"),
                 )
+                result = next(results)
                 dets = []
-                for r in results:
-                    for box in r.boxes:
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        dets.append({
-                            "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                            "conf": float(box.conf[0]),
-                            "cls": int(box.cls[0]),
-                            "label": r.names[int(box.cls[0])],
-                        })
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    dets.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "conf": float(box.conf[0]),
+                        "cls": int(box.cls[0]),
+                        "label": self.model.names[int(box.cls[0])],
+                    })
                 with self._lock:
                     self._results = dets
+            except StopIteration:
+                pass
             except Exception as e:
                 logger.error(f"YOLO inference error: {e}")
+                time.sleep(0.1)
 
 
 def draw_detections(frame: np.ndarray, detections: list[dict]) -> np.ndarray:
+    out = frame.copy()
     for det in detections:
-        x1, y1, x2, y2 = [int(v) for v in det["bbox"]]
+        x1, y1, x2, y2 = det["bbox"]
         color = COLORS[det["cls"] % len(COLORS)]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         label = f'{det["label"]} {det["conf"]:.0%}'
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(frame, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-    return frame
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.rectangle(out, (x1, y1 - th - baseline - 6), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(out, label, (x1 + 3, y1 - baseline - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
 
 
 # ── Session Storage ──
@@ -281,11 +327,11 @@ async def ipeye_login(body: dict):
 
     device_ids = [c["id"] for c in cameras]
     if device_ids:
-        status = await asyncio.to_thread(client.get_stream_info, device_ids)
-        if isinstance(status, dict):
+        statuses = await asyncio.to_thread(client.get_stream_status, device_ids)
+        if isinstance(statuses, dict):
             for cam in cameras:
-                info = status.get(cam["id"], {})
-                cam["online"] = info.get("status") == "online" if info else False
+                info = statuses.get(cam["id"], {})
+                cam["online"] = int(info.get("status", 0)) == 3
                 cam["width"] = int(info.get("Width", 0) or 0)
                 cam["height"] = int(info.get("Height", 0) or 0)
 
@@ -308,7 +354,7 @@ async def list_models():
     return {"models": models}
 
 
-# ── Stream Pipeline ──
+# ── Stream Pipeline (порт из оригинала StreamPlayer) ──
 
 class StreamPipeline:
     def __init__(self, ipeye_client: IpeyeClient, device_id: str,
@@ -326,6 +372,11 @@ class StreamPipeline:
         self.width = 1280
         self.height = 720
         self.error: Optional[str] = None
+
+        self._init_buf = b""
+        self._got_moov = False
+        self._ffmpeg_started = False
+        self._pending_chunks: list[bytes] = []
 
     def start(self):
         self.running = True
@@ -345,15 +396,21 @@ class StreamPipeline:
 
     def stop(self):
         self.running = False
-        if self.detector:
-            self.detector.stop()
-        if self._ffmpeg_proc:
+        if self._ws:
             try:
-                self._ffmpeg_proc.stdin.close()
+                self._ws.close()
             except Exception:
                 pass
+        if self.detector:
+            self.detector.stop()
+        if self._ffmpeg_stdin:
             try:
-                self._ffmpeg_proc.kill()
+                self._ffmpeg_stdin.close()
+            except Exception:
+                pass
+        if self._ffmpeg_proc:
+            try:
+                self._ffmpeg_proc.terminate()
             except Exception:
                 pass
 
@@ -363,156 +420,216 @@ class StreamPipeline:
             return p
         return name
 
+    _ws = None
+    _ffmpeg_stdin = None
+
+    # ── FFmpeg (точная копия оригинала) ──
+
+    def _start_ffmpeg(self, init_data: bytes):
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+genpts+discardcorrupt+nobuffer",
+            "-flags", "low_delay",
+            "-analyzeduration", "3000000",
+            "-probesize", "5000000",
+            "-f", "mp4",
+            "-i", "pipe:0",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-an", "-sn",
+            "pipe:1",
+        ]
+        self._ffmpeg_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=10 ** 6,
+        )
+        self._ffmpeg_stdin = self._ffmpeg_proc.stdin
+
+        self._ffmpeg_stdin.write(init_data)
+        self._ffmpeg_stdin.flush()
+        logger.info(f"FFmpeg init segment: {len(init_data)} bytes")
+
+        for chunk in self._pending_chunks:
+            try:
+                self._ffmpeg_stdin.write(chunk)
+            except Exception:
+                break
+        self._ffmpeg_stdin.flush()
+        self._pending_chunks.clear()
+        self._ffmpeg_started = True
+
+        self._reader_thread = threading.Thread(target=self._read_frames, daemon=True)
+        self._reader_thread.start()
+        threading.Thread(target=self._log_stderr, daemon=True).start()
+
+    def _feed(self, data: bytes):
+        if self._ffmpeg_started and self._ffmpeg_stdin:
+            try:
+                self._ffmpeg_stdin.write(data)
+                self._ffmpeg_stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+        else:
+            self._pending_chunks.append(data)
+
+    def _read_frames(self):
+        frame_size = self.width * self.height * 3
+        buf = b""
+        stdout = self._ffmpeg_proc.stdout
+
+        while self.running:
+            chunk = stdout.read(frame_size - len(buf))
+            if not chunk:
+                if self._ffmpeg_proc and self._ffmpeg_proc.poll() is not None:
+                    logger.info("FFmpeg process exited")
+                    break
+                time.sleep(0.005)
+                continue
+            buf += chunk
+            while len(buf) >= frame_size:
+                raw = buf[:frame_size]
+                buf = buf[frame_size:]
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                    (self.height, self.width, 3)
+                )
+
+                if self.detector:
+                    self.detector.submit(frame.copy())
+                    dets = self.detector.get_results()
+                    if dets:
+                        frame = draw_detections(frame, dets)
+
+                _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                self.frame_queue.append(jpeg.tobytes())
+
+        logger.info("Frame reader stopped")
+
+    def _log_stderr(self):
+        if not self._ffmpeg_proc or not self._ffmpeg_proc.stderr:
+            return
+        for line in self._ffmpeg_proc.stderr:
+            text = line.decode("utf-8", errors="replace").strip()
+            if text:
+                logger.debug(f"ffmpeg: {text}")
+
+    # ── WebSocket к камере (точная копия оригинала StreamPlayer) ──
+
     def _run_ws(self):
         import websocket as ws_lib
 
         try:
-            auth = self.client.authorize_stream(self.device_id)
-            ws_server = auth.get("server", "")
-            stream_name = auth.get("stream_name", self.device_id)
+            ws_server = self.client.authorize_stream(self.device_id)
 
             if not ws_server:
                 self.error = "Failed to authorize stream"
                 self.running = False
                 return
 
-            status = self.client.get_stream_info([self.device_id])
-            if isinstance(status, dict) and self.device_id in status:
-                info = status[self.device_id]
+            statuses = self.client.get_stream_status([self.device_id])
+            if isinstance(statuses, dict) and self.device_id in statuses:
+                info = statuses[self.device_id]
                 self.width = int(info.get("Width", 1280)) or 1280
                 self.height = int(info.get("Height", 720)) or 720
 
-            self._start_ffmpeg()
-
-            ws_url = f"wss://{ws_server}/ws/mp4/live?name={stream_name}"
+            # URL использует device_id как name (как в оригинале)
+            ws_url = f"wss://{ws_server}/ws/mp4/live?name={self.device_id}"
             logger.info(f"Connecting to camera WS: {ws_url} ({self.width}x{self.height})")
 
-            init_buf = bytearray()
-            has_ftyp = False
-            has_moov = False
-            init_done = False
+            msg_count = 0
+
+            def on_open(ws_conn):
+                logger.info(f"Camera WS connected to {ws_server}")
 
             def on_message(ws_conn, message):
-                nonlocal init_buf, has_ftyp, has_moov, init_done
+                nonlocal msg_count
 
                 if not self.running:
                     ws_conn.close()
                     return
-                if isinstance(message, str):
+                if not isinstance(message, bytes):
+                    logger.debug(f"WS text: {str(message)[:200]}")
                     return
 
-                data = bytes(message)
+                msg_count += 1
+                if len(message) < 8:
+                    return
 
-                if not init_done:
-                    init_buf.extend(data)
-                    pos = 0
-                    while pos + 8 <= len(init_buf):
-                        size = struct.unpack(">I", init_buf[pos:pos + 4])[0]
-                        box_type = init_buf[pos + 4:pos + 8]
-                        if size < 8 or pos + size > len(init_buf):
-                            break
-                        if box_type == b"ftyp":
-                            has_ftyp = True
-                        elif box_type == b"moov":
-                            has_moov = True
-                        pos += size
+                box_type = message[4:8]
 
-                    if has_ftyp and has_moov:
-                        init_done = True
-                        self._write_ffmpeg(bytes(init_buf))
-                        init_buf = bytearray()
-                else:
-                    self._write_ffmpeg(data)
+                if msg_count <= 5:
+                    logger.info(f"WS msg#{msg_count}: {len(message)} bytes, box={box_type}")
+
+                if box_type not in VALID_BOXES:
+                    return
+
+                # Собираем init-сегмент: ftyp + moov
+                if not self._got_moov:
+                    if box_type == b"ftyp":
+                        self._init_buf = message
+                        if b"moov" in message:
+                            self._got_moov = True
+                            logger.info(f"ftyp+moov in one message: {len(message)} bytes")
+                            threading.Thread(
+                                target=self._start_ffmpeg,
+                                args=(self._init_buf,),
+                                daemon=True,
+                            ).start()
+                        else:
+                            logger.info(f"ftyp: {len(message)} bytes, waiting for moov...")
+                        return
+                    elif box_type == b"moov":
+                        self._init_buf += message
+                        self._got_moov = True
+                        logger.info(f"moov: {len(message)} bytes, total init: {len(self._init_buf)} bytes")
+                        threading.Thread(
+                            target=self._start_ffmpeg,
+                            args=(self._init_buf,),
+                            daemon=True,
+                        ).start()
+                        return
+                    elif box_type == b"styp":
+                        self._init_buf += message
+                        return
+                    else:
+                        return
+
+                self._feed(message)
 
             def on_error(ws_conn, error):
                 logger.error(f"Camera WS error: {error}")
                 self.error = str(error)
 
             def on_close(ws_conn, code, msg):
-                logger.info(f"Camera WS closed: {code}")
+                logger.info(f"Camera WS closed: code={code}, msg={msg}")
                 self.running = False
 
-            ws_conn = ws_lib.WebSocketApp(
+            self._ws = ws_lib.WebSocketApp(
                 ws_url,
+                header={
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
+                    "Accept-Language": "ru",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "User-Agent": USER_AGENT,
+                },
+                on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
                 on_close=on_close,
-                header={
-                    "Origin": "https://www.ipeye.ru",
-                    "User-Agent": IpeyeClient.UA,
-                },
             )
-            ws_conn.run_forever()
+            self._ws.run_forever(
+                origin=ORIGIN,
+                skip_utf8_validation=True,
+            )
         except Exception as e:
             logger.error(f"Stream pipeline error: {e}")
             self.error = str(e)
         finally:
             self.running = False
-
-    def _start_ffmpeg(self):
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-f", "mp4", "-i", "pipe:0",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-vsync", "drop", "pipe:1",
-        ]
-        self._ffmpeg_proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        self._reader_thread = threading.Thread(target=self._read_frames, daemon=True)
-        self._reader_thread.start()
-        threading.Thread(target=self._log_stderr, daemon=True).start()
-
-    def _write_ffmpeg(self, data: bytes):
-        try:
-            if self._ffmpeg_proc and self._ffmpeg_proc.stdin and not self._ffmpeg_proc.stdin.closed:
-                self._ffmpeg_proc.stdin.write(data)
-                self._ffmpeg_proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-
-    def _read_frames(self):
-        frame_size = self.width * self.height * 3
-        buf = bytearray()
-
-        while self.running and self._ffmpeg_proc:
-            try:
-                chunk = self._ffmpeg_proc.stdout.read(min(frame_size - len(buf), 65536))
-                if not chunk:
-                    break
-                buf.extend(chunk)
-
-                while len(buf) >= frame_size:
-                    frame_data = bytes(buf[:frame_size])
-                    buf = buf[frame_size:]
-
-                    frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(
-                        (self.height, self.width, 3)
-                    )
-
-                    if self.detector:
-                        self.detector.submit(frame.copy())
-                        dets = self.detector.get_results()
-                        if dets:
-                            frame = draw_detections(frame.copy(), dets)
-
-                    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                    self.frame_queue.append(jpeg.tobytes())
-            except Exception as e:
-                logger.error(f"Frame read error: {e}")
-                break
-
-        logger.info("Frame reader stopped")
-
-    def _log_stderr(self):
-        while self.running and self._ffmpeg_proc:
-            try:
-                line = self._ffmpeg_proc.stderr.readline()
-                if not line:
-                    break
-                logger.debug(f"ffmpeg: {line.decode(errors='replace').strip()}")
-            except Exception:
-                break
 
 
 @app.websocket("/ws/stream")
