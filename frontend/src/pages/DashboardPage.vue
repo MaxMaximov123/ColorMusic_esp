@@ -1,28 +1,25 @@
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../composables/useAuth.js'
 import { useWebSocket } from '../composables/useWebSocket.js'
 import ColorMusicPanel from '../components/ColorMusicPanel.vue'
 import TempSensorPanel from '../components/TempSensorPanel.vue'
+import CameraPanel from '../components/CameraPanel.vue'
 
 const router = useRouter()
 const { logout } = useAuth()
 const { devices, connected, calibrationResult, sendCommand, requestCalibrate } = useWebSocket()
 
-const selectedTab = ref(null)
-
-const selectedDevice = computed(() => {
-  if (!selectedTab.value) return null
-  return devices.value.find(d => d.id === selectedTab.value) || null
-})
+const selectedTab = ref('cameras')
 
 watch(devices, (list) => {
+  if (selectedTab.value === 'cameras') return
   if (list.length > 0 && !selectedTab.value) {
     selectedTab.value = list[0].id
   }
-  if (selectedTab.value && !list.find(d => d.id === selectedTab.value)) {
-    selectedTab.value = list.length > 0 ? list[0].id : null
+  if (selectedTab.value && selectedTab.value !== 'cameras' && !list.find(d => d.id === selectedTab.value)) {
+    selectedTab.value = list.length > 0 ? list[0].id : 'cameras'
   }
 }, { deep: true })
 
@@ -52,7 +49,6 @@ function doLogout() {
       </q-toolbar>
 
       <q-tabs
-        v-if="devices.length > 0"
         v-model="selectedTab"
         align="left"
         active-color="primary"
@@ -74,18 +70,13 @@ function doLogout() {
             <span>{{ dev.name || dev.id }}</span>
           </div>
         </q-tab>
+        <q-tab name="cameras" no-caps icon="videocam" label="Камеры" />
       </q-tabs>
     </q-header>
 
     <q-page-container>
       <q-page class="q-pa-md" style="max-width: 600px; margin: 0 auto;">
-        <div v-if="devices.length === 0" class="text-center q-pa-xl text-grey-6">
-          <q-icon name="devices" size="64px" class="q-mb-md" />
-          <div class="text-h6">Нет подключённых устройств</div>
-        </div>
-
         <q-tab-panels
-          v-else-if="selectedTab"
           v-model="selectedTab"
           animated
           class="bg-transparent"
@@ -111,6 +102,10 @@ function doLogout() {
             <div v-else class="text-grey-6 text-center q-pa-lg">
               Неизвестный тип устройства: {{ dev.deviceType }}
             </div>
+          </q-tab-panel>
+
+          <q-tab-panel name="cameras" class="q-pa-none">
+            <CameraPanel />
           </q-tab-panel>
         </q-tab-panels>
       </q-page>

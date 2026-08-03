@@ -23,7 +23,7 @@
 #define TG_USERS  "1387680086,629395593,5207110017"
 
 // ----- интервалы -----
-#define STATE_INTERVAL  60000   // 60 сек — отправка на сервер
+#define STATE_INTERVAL  5000   // 60 сек — отправка на сервер
 
 // ========================= БИБЛИОТЕКИ =========================
 
@@ -41,7 +41,7 @@
 
 // ========================= СТРУКТУРА НАСТРОЕК =========================
 
-#define SETTINGS_MARKER 0xA2
+#define SETTINGS_MARKER 0xA3
 
 struct Settings {
   uint8_t marker;
@@ -51,6 +51,7 @@ struct Settings {
   uint16_t ws_port;
   float threshold;
   bool set_limit_mode;
+  bool notify_enabled;
 };
 
 Settings cfg;
@@ -269,6 +270,11 @@ bool applyParam(const char* key, JsonVariant val) {
     Serial.printf("Threshold set: %.1f\n", cfg.threshold);
     return true;
   }
+  if (strcmp(key, "notify") == 0) {
+    cfg.notify_enabled = val.as<int>() != 0;
+    Serial.printf("Notify: %s\n", cfg.notify_enabled ? "on" : "off");
+    return true;
+  }
   return false;
 }
 
@@ -276,6 +282,7 @@ String buildStateJson() {
   String json = "{";
   json += "\"temp\":" + String(currentTemp, 1);
   json += ",\"threshold\":" + String(cfg.threshold, 1);
+  json += ",\"notify\":" + String(cfg.notify_enabled ? 1 : 0);
   json += "}";
   return json;
 }
@@ -301,7 +308,7 @@ void stateTick() {
   if (wsConnected) sendState();
 
   // проверка порога (как в оригинале — одно уведомление, сброс при запросе температуры)
-  if (currentTemp < cfg.threshold && send_msg) {
+  if (cfg.notify_enabled && currentTemp < cfg.threshold && send_msg) {
     bot.sendMessage("\xE2\x9D\x97\xEF\xB8\x8F\xD0\x92\xD0\xBD\xD0\xB8\xD0\xBC\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xB5! \xD0\xA2\xD0\xB5\xD0\xBC\xD0\xBF\xD0\xB5\xD1\x80\xD0\xB0\xD1\x82\xD1\x83\xD1\x80\xD0\xB0 \xD0\xBC\xD0\xB5\xD0\xBD\xD1\x8C\xD1\x88\xD0\xB5 " + String(cfg.threshold, 1) + " \xC2\xB0\x43.\n\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB5\xD0\xB7\xD0\xB6\xD0\xB0\xD0\xB9\xD1\x82\xD0\xB5 \xD0\xB4\xD0\xBE\xD0\xBC\xD0\xBE\xD0\xB9!");
     send_msg = false;
   }
@@ -317,6 +324,7 @@ void setDefaults() {
   cfg.ws_port = DEFAULT_WS_PORT;
   cfg.threshold = DEFAULT_THRESHOLD;
   cfg.set_limit_mode = false;
+  cfg.notify_enabled = true;
 }
 
 void loadSettings() {

@@ -5,6 +5,8 @@ services:
       POSTGRES_DB: ${DB_NAME:-smarthome}
       POSTGRES_USER: ${DB_USER:-smarthome}
       POSTGRES_PASSWORD: ${DB_PASS:-smarthome}
+    ports:
+      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./server/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -17,7 +19,19 @@ services:
     env_file: .env
     depends_on:
       - postgres
+      - detector
+    restart: unless-stopped
+
+  detector:
+    build: ./detector
+    ports:
+      - "8001:8001"
+    volumes:
+      - yolo_models:/models
+    environment:
+      - MODELS_DIR=/models
     restart: unless-stopped
 
 volumes:
   pgdata:
+  yolo_models:

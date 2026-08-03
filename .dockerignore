@@ -3,7 +3,11 @@ frontend/node_modules
 server/node_modules
 server/public
 firmware
+detector
 .DS_Store
 .env
 *.ino
 *.h
+*.pt
+__pycache__
+.claude

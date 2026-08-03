@@ -16,5 +16,8 @@ export default defineConfig({
       '/ws': { target: 'http://localhost:3000', ws: true },
       '/api': { target: 'http://localhost:3000' }
     }
+  },
+  define: {
+    __DETECTOR_WS_PORT__: JSON.stringify('3000')
   }
 })

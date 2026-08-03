@@ -7,11 +7,15 @@ const jwt = require('jsonwebtoken');
 const url = require('url');
 const knex = require('knex');
 
+const WebSocket = require('ws');
+
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const JWT_EXPIRES = '24h';
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin';
+const DETECTOR_HOST = process.env.DETECTOR_HOST || 'detector';
+const DETECTOR_PORT = process.env.DETECTOR_PORT || '8001';
 
 // ── Database (knex) ──
 
@@ -140,6 +144,35 @@ app.get('/api/temperature/:deviceId', authMiddleware, async (req, res) => {
   }
 });
 
+// ── Detector proxy ──
+
+app.use('/api/detector', authMiddleware, (req, res) => {
+  const detectorPath = '/api' + req.url;
+  const options = {
+    hostname: DETECTOR_HOST,
+    port: parseInt(DETECTOR_PORT),
+    path: detectorPath,
+    method: req.method,
+    headers: { 'Content-Type': 'application/json' },
+  };
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.status(proxyRes.statusCode);
+    Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error('[detector-proxy]', err.message);
+    res.status(502).json({ error: 'Detector service unavailable' });
+  });
+
+  if (req.method !== 'GET' && req.body) {
+    proxyReq.write(JSON.stringify(req.body));
+  }
+  proxyReq.end();
+});
+
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -173,6 +206,7 @@ function sendJson(ws, obj) {
 const server = http.createServer(app);
 const wssDevice = new WebSocketServer({ noServer: true });
 const wssClient = new WebSocketServer({ noServer: true });
+const wssCamera = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
@@ -195,7 +229,64 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
+  if (pathname === '/ws/camera') {
+    const token = query.token;
+    if (!token) { socket.destroy(); return; }
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch {
+      socket.destroy();
+      return;
+    }
+    wssCamera.handleUpgrade(req, socket, head, ws => wssCamera.emit('connection', ws, req));
+    return;
+  }
+
   socket.destroy();
+});
+
+// ── Camera WS proxy (bridge to detector service) ──
+
+wssCamera.on('connection', (clientWs) => {
+  const detectorUrl = `ws://${DETECTOR_HOST}:${DETECTOR_PORT}/ws/stream`;
+  const detectorWs = new WebSocket(detectorUrl);
+
+  detectorWs.on('open', () => {
+    console.log('[camera-proxy] connected to detector');
+  });
+
+  clientWs.on('message', (data, isBinary) => {
+    if (detectorWs.readyState === WebSocket.OPEN) {
+      detectorWs.send(data, { binary: isBinary });
+    }
+  });
+
+  detectorWs.on('message', (data, isBinary) => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(data, { binary: isBinary });
+    }
+  });
+
+  clientWs.on('close', () => {
+    detectorWs.close();
+    console.log('[camera-proxy] client disconnected');
+  });
+
+  detectorWs.on('close', () => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
+  });
+
+  detectorWs.on('error', (err) => {
+    console.error('[camera-proxy] detector error:', err.message);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ error: 'Detector service unavailable' }));
+      clientWs.close();
+    }
+  });
+
+  clientWs.on('error', () => {
+    detectorWs.close();
+  });
 });
 
 // ── Device connections ──
