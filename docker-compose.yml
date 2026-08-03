@@ -11,6 +11,11 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./server/init.sql:/docker-entrypoint-initdb.d/init.sql
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
 
   app:
     build: .
@@ -20,17 +25,25 @@ services:
     depends_on:
       - postgres
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
 
   detector:
     build: ./detector
     ports:
       - "8001:8001"
-    volumes:
-      - yolo_models:/models
     environment:
-      - MODELS_DIR=/models
+      - JPEG_QUALITY=5
+      - MAX_FPS=15
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
 
 volumes:
   pgdata:
-  yolo_models:

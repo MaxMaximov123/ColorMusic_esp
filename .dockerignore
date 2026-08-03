@@ -8,6 +8,5 @@ detector
 .env
 *.ino
 *.h
-*.pt
 __pycache__
 .claude
