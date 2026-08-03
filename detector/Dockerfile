@@ -15,7 +15,16 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml .
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system --extra-index-url https://download.pytorch.org/whl/cpu -r pyproject.toml
+    uv pip install --system --extra-index-url https://download.pytorch.org/whl/cpu \
+    fastapi==0.115.6 \
+    "uvicorn[standard]==0.34.0" \
+    websocket-client==1.8.0 \
+    requests==2.32.3 \
+    opencv-python-headless==4.10.0.84 \
+    "numpy>=1.26,<2" \
+    "ultralytics>=8.3.0" \
+    "torch>=2.1.0" \
+    "torchvision>=0.16.0"
 
 COPY main.py .
 
