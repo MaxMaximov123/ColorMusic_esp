@@ -250,14 +250,23 @@ server.on('upgrade', (req, socket, head) => {
 wssCamera.on('connection', (clientWs) => {
   const detectorUrl = `ws://${DETECTOR_HOST}:${DETECTOR_PORT}/ws/stream`;
   const detectorWs = new WebSocket(detectorUrl);
+  const pendingMessages = [];
+  let detectorOpen = false;
 
   detectorWs.on('open', () => {
     console.log('[camera-proxy] connected to detector');
+    detectorOpen = true;
+    for (const { data, isBinary } of pendingMessages) {
+      detectorWs.send(data, { binary: isBinary });
+    }
+    pendingMessages.length = 0;
   });
 
   clientWs.on('message', (data, isBinary) => {
-    if (detectorWs.readyState === WebSocket.OPEN) {
+    if (detectorOpen && detectorWs.readyState === WebSocket.OPEN) {
       detectorWs.send(data, { binary: isBinary });
+    } else {
+      pendingMessages.push({ data, isBinary });
     }
   });
 
