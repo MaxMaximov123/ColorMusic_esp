@@ -31,19 +31,5 @@ services:
           cpus: "0.50"
           memory: 256M
 
-  detector:
-    build: ./detector
-    ports:
-      - "8001:8001"
-    environment:
-      - JPEG_QUALITY=5
-      - MAX_FPS=15
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: "0.50"
-          memory: 256M
-
 volumes:
   pgdata:

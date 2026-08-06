@@ -6,16 +6,13 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const url = require('url');
 const knex = require('knex');
-
-const WebSocket = require('ws');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const JWT_EXPIRES = '24h';
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin';
-const DETECTOR_HOST = process.env.DETECTOR_HOST || 'detector';
-const DETECTOR_PORT = process.env.DETECTOR_PORT || '8001';
 
 // ── Database (knex) ──
 
@@ -154,49 +151,166 @@ app.get('/api/temperature/:deviceId', authMiddleware, async (req, res) => {
   }
 });
 
-// ── IPeye credentials ──
+// ── IPeye Client ──
 
-function callDetectorLogin(login, password) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ login, password });
-    const req = http.request({
-      hostname: DETECTOR_HOST,
-      port: parseInt(DETECTOR_PORT),
-      path: '/api/login',
+const IPEYE_BASE = 'https://www.ipeye.ru/ipeye_service/index.php';
+const IPEYE_SITE = 'https://www.ipeye.ru';
+const IPEYE_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+
+class IpeyeClient {
+  constructor() {
+    this.cookies = {};
+    this.loggedIn = false;
+  }
+
+  _parseCookies(resp) {
+    const setCookie = resp.headers.getSetCookie?.() || [];
+    for (const h of setCookie) {
+      const pair = h.split(';')[0];
+      const eq = pair.indexOf('=');
+      if (eq > 0) this.cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+    }
+  }
+
+  _cookieStr() {
+    return Object.entries(this.cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+
+  async login(login, password) {
+    let r = await fetch(IPEYE_SITE + '/', {
+      headers: { 'User-Agent': IPEYE_UA, Accept: 'text/html' },
+    });
+    this._parseCookies(r);
+
+    r = await fetch(`${IPEYE_BASE}?route=proc_login`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
+        'User-Agent': IPEYE_UA,
+        Accept: 'application/json, text/javascript, */*; q=0.01',
+        Referer: IPEYE_SITE + '/',
+        'X-Requested-With': 'XMLHttpRequest',
+        Origin: IPEYE_SITE,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        Cookie: this._cookieStr(),
       },
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch { reject(new Error('Invalid detector response')); }
-      });
+      body: new URLSearchParams({
+        service_url_relative: 'ipeye_service/',
+        login,
+        pass: password,
+        captcha: 'false',
+      }).toString(),
     });
-    req.on('error', reject);
-    req.setTimeout(30000, () => req.destroy(new Error('timeout')));
-    req.write(body);
-    req.end();
-  });
+    this._parseCookies(r);
+    if (r.status !== 200) return false;
+
+    r = await fetch(`${IPEYE_BASE}?route=page_index`, {
+      headers: {
+        'User-Agent': IPEYE_UA, Accept: 'text/html',
+        Referer: IPEYE_SITE + '/', Cookie: this._cookieStr(),
+      },
+    });
+    this._parseCookies(r);
+    this.loggedIn = true;
+    return true;
+  }
+
+  async getCameras() {
+    const data = new URLSearchParams();
+    data.set('draw', '1');
+    data.set('start', '0');
+    data.set('length', '100');
+    data.set('search[value]', '');
+    data.set('search[regex]', 'true');
+    data.set('order[0][column]', '2');
+    data.set('order[0][dir]', 'asc');
+    const cols = [
+      'devices.devcode', 'devices.devcode', 'devices.name',
+      'devices_groups.name', 'tariffs.name', 'devices.dvr_limit',
+      '', '', '', 'devices_groups.id', 'devices.permissions',
+      'devices.model_id', 'devices.storage_server',
+    ];
+    cols.forEach((c, i) => {
+      data.set(`columns[${i}][data]`, c);
+      data.set(`columns[${i}][name]`, '');
+      data.set(`columns[${i}][searchable]`, c ? 'true' : 'false');
+      data.set(`columns[${i}][orderable]`, c ? 'true' : 'false');
+      data.set(`columns[${i}][search][value]`, '');
+      data.set(`columns[${i}][search][regex]`, 'false');
+    });
+
+    const r = await fetch(`${IPEYE_BASE}?route=proc_device`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': IPEYE_UA,
+        Accept: 'application/json, text/javascript, */*; q=0.01',
+        Referer: `${IPEYE_BASE}?route=page_index`,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        Cookie: this._cookieStr(),
+      },
+      body: data.toString(),
+    });
+    if (r.status !== 200) return [];
+    const result = await r.json();
+    return (result.data || []).map(d => ({ id: d.devcode || '', name: d.device_name || '' }));
+  }
+
+  async authorizeStream(deviceId) {
+    const r = await fetch(
+      `${IPEYE_BASE}?route=page_play_ajax&new_websocket&devid=${deviceId}`,
+      {
+        headers: {
+          'User-Agent': IPEYE_UA, Accept: '*/*',
+          Referer: `${IPEYE_BASE}?route=page_play&devcode=${deviceId}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          Cookie: this._cookieStr(),
+        },
+      }
+    );
+    if (r.status !== 200) return null;
+    const data = await r.json();
+    return data.server || null;
+  }
 }
+
+const ipeyeSessions = new Map();
+
+// ── IPeye endpoints ──
 
 app.get('/api/ipeye/connect', authMiddleware, async (req, res) => {
   try {
     const cred = await db('ipeye_credentials').where('user_id', req.user.id).first();
     if (!cred) return res.json({ saved: false });
 
-    const result = await callDetectorLogin(cred.ipeye_login, cred.ipeye_password);
-    if (result.status === 200) {
-      res.json(result.data);
-    } else {
-      res.json({ saved: true, error: result.data.error || 'IPeye auth failed' });
-    }
+    const client = new IpeyeClient();
+    const ok = await client.login(cred.ipeye_login, cred.ipeye_password);
+    if (!ok) return res.json({ saved: true, error: 'IPeye auth failed' });
+
+    const cameras = await client.getCameras();
+    const sessionId = crypto.randomUUID();
+    ipeyeSessions.set(sessionId, client);
+    res.json({ session: sessionId, cameras });
   } catch (err) {
     console.error('[ipeye-connect]', err.message);
     res.json({ saved: false, error: 'Сервис видеонаблюдения недоступен' });
+  }
+});
+
+app.post('/api/ipeye/login', authMiddleware, async (req, res) => {
+  const { login, password } = req.body || {};
+  if (!login || !password) return res.status(400).json({ error: 'Credentials required' });
+  try {
+    const client = new IpeyeClient();
+    const ok = await client.login(login, password);
+    if (!ok) return res.status(401).json({ error: 'Ошибка авторизации IPeye' });
+
+    const cameras = await client.getCameras();
+    const sessionId = crypto.randomUUID();
+    ipeyeSessions.set(sessionId, client);
+    res.json({ session: sessionId, cameras });
+  } catch (err) {
+    console.error('[ipeye-login]', err.message);
+    res.status(500).json({ error: 'Сервис видеонаблюдения недоступен' });
   }
 });
 
@@ -225,33 +339,20 @@ app.delete('/api/ipeye/forget', authMiddleware, async (req, res) => {
   }
 });
 
-// ── Detector proxy ──
-
-app.use('/api/detector', authMiddleware, (req, res) => {
-  const detectorPath = '/api' + req.url;
-  const options = {
-    hostname: DETECTOR_HOST,
-    port: parseInt(DETECTOR_PORT),
-    path: detectorPath,
-    method: req.method,
-    headers: { 'Content-Type': 'application/json' },
-  };
-
-  const proxyReq = http.request(options, (proxyRes) => {
-    res.status(proxyRes.statusCode);
-    Object.entries(proxyRes.headers).forEach(([k, v]) => res.setHeader(k, v));
-    proxyRes.pipe(res);
-  });
-
-  proxyReq.on('error', (err) => {
-    console.error('[detector-proxy]', err.message);
-    res.status(502).json({ error: 'Detector service unavailable' });
-  });
-
-  if (req.method !== 'GET' && req.body) {
-    proxyReq.write(JSON.stringify(req.body));
+app.get('/api/ipeye/authorize/:cameraId', authMiddleware, async (req, res) => {
+  const { session } = req.query;
+  if (!session || !ipeyeSessions.has(session)) {
+    return res.status(400).json({ error: 'Invalid IPeye session' });
   }
-  proxyReq.end();
+  try {
+    const client = ipeyeSessions.get(session);
+    const wsServer = await client.authorizeStream(req.params.cameraId);
+    if (!wsServer) return res.status(502).json({ error: 'Failed to authorize stream' });
+    res.json({ wsUrl: `wss://${wsServer}/ws/mp4/live?name=${req.params.cameraId}` });
+  } catch (err) {
+    console.error('[ipeye-authorize]', err.message);
+    res.status(500).json({ error: 'Authorization failed' });
+  }
 });
 
 app.get('*', (req, res) => {
@@ -287,7 +388,6 @@ function sendJson(ws, obj) {
 const server = http.createServer(app);
 const wssDevice = new WebSocketServer({ noServer: true });
 const wssClient = new WebSocketServer({ noServer: true });
-const wssCamera = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
@@ -312,75 +412,7 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
 
-  if (pathname === '/ws/camera') {
-    const token = query.token;
-    if (!token) { socket.destroy(); return; }
-    try {
-      jwt.verify(token, JWT_SECRET);
-    } catch {
-      wssCamera.handleUpgrade(req, socket, head, ws => {
-        ws.close(4001, 'Token expired');
-      });
-      return;
-    }
-    wssCamera.handleUpgrade(req, socket, head, ws => wssCamera.emit('connection', ws, req));
-    return;
-  }
-
   socket.destroy();
-});
-
-// ── Camera WS proxy (bridge to detector service) ──
-
-wssCamera.on('connection', (clientWs) => {
-  const detectorUrl = `ws://${DETECTOR_HOST}:${DETECTOR_PORT}/ws/stream`;
-  const detectorWs = new WebSocket(detectorUrl);
-  const pendingMessages = [];
-  let detectorOpen = false;
-
-  detectorWs.on('open', () => {
-    console.log('[camera-proxy] connected to detector');
-    detectorOpen = true;
-    for (const { data, isBinary } of pendingMessages) {
-      detectorWs.send(data, { binary: isBinary });
-    }
-    pendingMessages.length = 0;
-  });
-
-  clientWs.on('message', (data, isBinary) => {
-    if (detectorOpen && detectorWs.readyState === WebSocket.OPEN) {
-      detectorWs.send(data, { binary: isBinary });
-    } else {
-      pendingMessages.push({ data, isBinary });
-    }
-  });
-
-  detectorWs.on('message', (data, isBinary) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(data, { binary: isBinary });
-    }
-  });
-
-  clientWs.on('close', () => {
-    detectorWs.close();
-    console.log('[camera-proxy] client disconnected');
-  });
-
-  detectorWs.on('close', () => {
-    if (clientWs.readyState === WebSocket.OPEN) clientWs.close();
-  });
-
-  detectorWs.on('error', (err) => {
-    console.error('[camera-proxy] detector error:', err.message);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify({ error: 'Detector service unavailable' }));
-      clientWs.close();
-    }
-  });
-
-  clientWs.on('error', () => {
-    detectorWs.close();
-  });
 });
 
 // ── Device connections ──

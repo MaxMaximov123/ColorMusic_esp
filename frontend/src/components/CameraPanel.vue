@@ -17,10 +17,15 @@ const streamError = ref('')
 const isFullscreen = ref(false)
 const autoConnecting = ref(true)
 
-const canvasRef = ref(null)
-const fsCanvasRef = ref(null)
-const fsOverlayRef = ref(null)
+const videoRef = ref(null)
+const videoContainerRef = ref(null)
+
 let ws = null
+let mediaSource = null
+let sourceBuffer = null
+let initSegment = null
+let pendingBuffers = []
+let moofBuffer = null
 
 const cameraOptions = computed(() =>
   cameras.value.map(c => ({ label: c.name || c.id, value: c.id }))
@@ -29,7 +34,6 @@ const cameraOptions = computed(() =>
 function onFullscreenChange() {
   if (!document.fullscreenElement && !document.webkitFullscreenElement) {
     isFullscreen.value = false
-    document.body.style.overflow = ''
   }
 }
 
@@ -52,7 +56,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopStream()
-  if (isFullscreen.value) exitFullscreen()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
 })
@@ -61,7 +64,7 @@ async function doIpeyeLogin() {
   loginLoading.value = true
   loginError.value = ''
   try {
-    const resp = await fetch('/api/detector/login', {
+    const resp = await fetch('/api/ipeye/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${getToken()}` },
       body: JSON.stringify({ login: ipeyeLogin.value, password: ipeyePassword.value })
@@ -82,61 +85,219 @@ async function doIpeyeLogin() {
 
 function toggleStream() { streaming.value ? stopStream() : startStream() }
 
-function startStream() {
+async function startStream() {
   if (!selectedCamera.value || !ipeyeSession.value) return
   streamError.value = ''
-  streamStatus.value = 'Подключение...'
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  ws = new WebSocket(`${protocol}//${location.host}/ws/camera?token=${encodeURIComponent(getToken())}`)
+  streamStatus.value = 'Авторизация потока...'
+
+  try {
+    const resp = await fetch(
+      `/api/ipeye/authorize/${selectedCamera.value}?session=${encodeURIComponent(ipeyeSession.value)}`,
+      { headers: { 'Authorization': `Bearer ${getToken()}` } }
+    )
+    const data = await resp.json()
+    if (!resp.ok) {
+      streamError.value = data.error || 'Ошибка авторизации потока'
+      streamStatus.value = ''
+      return
+    }
+
+    streamStatus.value = 'Подключение к камере...'
+    connectToStream(data.wsUrl)
+  } catch (err) {
+    streamError.value = 'Не удалось авторизовать поток'
+    streamStatus.value = ''
+  }
+}
+
+function connectToStream(wsUrl) {
+  initSegment = null
+  pendingBuffers = []
+  moofBuffer = null
+  mediaSource = null
+  sourceBuffer = null
+
+  ws = new WebSocket(wsUrl)
+  ws.binaryType = 'arraybuffer'
+
   ws.onopen = () => {
-    ws.send(JSON.stringify({ session: ipeyeSession.value, camera: selectedCamera.value }))
     streaming.value = true
+    streamStatus.value = 'Ожидание видеоданных...'
   }
+
   ws.onmessage = (event) => {
-    if (typeof event.data === 'string') {
-      try {
-        const msg = JSON.parse(event.data)
-        if (msg.status) streamStatus.value = msg.status === 'connecting' ? 'Подключение к камере...' : msg.status
-        if (msg.error) { streamError.value = msg.error; streamStatus.value = '' }
-      } catch {}
-    } else { streamStatus.value = ''; renderFrame(event.data) }
+    if (typeof event.data === 'string') return
+    handleFmp4Box(new Uint8Array(event.data))
   }
-  ws.onclose = () => { streaming.value = false; streamStatus.value = '' }
-  ws.onerror = () => { streamError.value = 'Ошибка соединения'; streaming.value = false }
+
+  ws.onclose = () => {
+    streaming.value = false
+    streamStatus.value = ''
+    cleanupMse()
+  }
+
+  ws.onerror = () => {
+    streamError.value = 'Ошибка соединения с камерой'
+    streaming.value = false
+    streamStatus.value = ''
+    cleanupMse()
+  }
+}
+
+function getBoxType(data) {
+  if (data.length < 8) return null
+  return String.fromCharCode(data[4], data[5], data[6], data[7])
+}
+
+function handleFmp4Box(data) {
+  const boxType = getBoxType(data)
+  if (!boxType) return
+
+  if (!initSegment) {
+    if (boxType === 'ftyp' || boxType === 'styp' || boxType === 'moov') {
+      if (!pendingBuffers.length && boxType !== 'ftyp') return
+      pendingBuffers.push(data)
+
+      if (boxType === 'moov' || (boxType === 'ftyp' && containsBox(data, 'moov'))) {
+        const total = pendingBuffers.reduce((s, b) => s + b.length, 0)
+        initSegment = new Uint8Array(total)
+        let offset = 0
+        for (const buf of pendingBuffers) {
+          initSegment.set(buf, offset)
+          offset += buf.length
+        }
+        pendingBuffers = []
+        initMse()
+      }
+      return
+    }
+    return
+  }
+
+  if (boxType === 'moof') {
+    moofBuffer = data
+    return
+  }
+
+  if (boxType === 'mdat' && moofBuffer) {
+    const segment = new Uint8Array(moofBuffer.length + data.length)
+    segment.set(moofBuffer, 0)
+    segment.set(data, moofBuffer.length)
+    moofBuffer = null
+    appendToSourceBuffer(segment)
+    return
+  }
+
+  if (boxType === 'sidx' || boxType === 'free' || boxType === 'skip' || boxType === 'mfra') {
+    return
+  }
+}
+
+function containsBox(data, type) {
+  const target = [type.charCodeAt(0), type.charCodeAt(1), type.charCodeAt(2), type.charCodeAt(3)]
+  for (let i = 0; i <= data.length - 8; i++) {
+    if (data[i + 4] === target[0] && data[i + 5] === target[1] &&
+        data[i + 6] === target[2] && data[i + 7] === target[3]) return true
+  }
+  return false
+}
+
+function initMse() {
+  const video = videoRef.value
+  if (!video || !initSegment) return
+
+  const mimeType = 'video/mp4; codecs="avc1.42E01E"'
+  if (!MediaSource.isTypeSupported(mimeType)) {
+    streamError.value = 'Браузер не поддерживает воспроизведение этого формата'
+    stopStream()
+    return
+  }
+
+  mediaSource = new MediaSource()
+  video.src = URL.createObjectURL(mediaSource)
+
+  mediaSource.addEventListener('sourceopen', () => {
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(mimeType)
+      sourceBuffer.mode = 'segments'
+      sourceBuffer.addEventListener('updateend', flushQueue)
+      appendToSourceBuffer(initSegment)
+      streamStatus.value = ''
+      video.play().catch(() => {})
+    } catch (err) {
+      streamError.value = 'Ошибка инициализации видео: ' + err.message
+      stopStream()
+    }
+  })
+}
+
+const appendQueue = []
+let isAppending = false
+
+function appendToSourceBuffer(data) {
+  appendQueue.push(data)
+  flushQueue()
+}
+
+function flushQueue() {
+  if (!sourceBuffer || sourceBuffer.updating || !appendQueue.length) return
+  if (mediaSource.readyState !== 'open') return
+
+  isAppending = true
+  const data = appendQueue.shift()
+  try {
+    sourceBuffer.appendBuffer(data)
+
+    if (sourceBuffer.buffered.length > 0) {
+      const buffered = sourceBuffer.buffered.end(0) - sourceBuffer.buffered.start(0)
+      if (buffered > 30) {
+        sourceBuffer.remove(sourceBuffer.buffered.start(0), sourceBuffer.buffered.end(0) - 10)
+      }
+    }
+  } catch (err) {
+    if (err.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
+      sourceBuffer.remove(sourceBuffer.buffered.start(0), sourceBuffer.buffered.end(0) - 5)
+    }
+  }
+}
+
+function cleanupMse() {
+  appendQueue.length = 0
+  isAppending = false
+  if (sourceBuffer) {
+    try { mediaSource.removeSourceBuffer(sourceBuffer) } catch {}
+    sourceBuffer = null
+  }
+  if (mediaSource && mediaSource.readyState === 'open') {
+    try { mediaSource.endOfStream() } catch {}
+  }
+  mediaSource = null
+  const video = videoRef.value
+  if (video) {
+    URL.revokeObjectURL(video.src)
+    video.src = ''
+    video.load()
+  }
 }
 
 function stopStream() {
   if (ws) { ws.close(); ws = null }
-  streaming.value = false; streamStatus.value = ''
+  streaming.value = false
+  streamStatus.value = ''
+  cleanupMse()
 }
 
-function renderFrame(blob) {
-  const canvas = isFullscreen.value ? fsCanvasRef.value : canvasRef.value
-  if (!canvas) return
-  const url = URL.createObjectURL(new Blob([blob], { type: 'image/jpeg' }))
-  const img = new Image()
-  img.onload = () => {
-    canvas.width = img.width; canvas.height = img.height
-    canvas.getContext('2d').drawImage(img, 0, 0)
-    URL.revokeObjectURL(url)
-  }
-  img.src = url
-}
-
-async function enterFullscreen() {
+function enterFullscreen() {
+  const container = videoContainerRef.value
+  if (!container) return
   isFullscreen.value = true
-  document.body.style.overflow = 'hidden'
-  await nextTick()
-  const el = fsOverlayRef.value
-  if (el) {
-    try { (el.requestFullscreen || el.webkitRequestFullscreen).call(el) } catch {}
-  }
+  const fn = container.requestFullscreen || container.webkitRequestFullscreen
+  if (fn) fn.call(container)
   try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
 }
 
 function exitFullscreen() {
   isFullscreen.value = false
-  document.body.style.overflow = ''
   try {
     if (document.fullscreenElement) document.exitFullscreen()
     else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
@@ -189,25 +350,18 @@ function doIpeyeLogout() {
             <q-spinner color="primary" size="2em" class="q-mr-sm" />{{ streamStatus }}
           </div>
           <div v-if="streamError" class="text-negative text-center q-pa-md text-caption">{{ streamError }}</div>
-          <div class="video-inline" :class="{ hidden: !!streamStatus && !streamError }">
-            <canvas ref="canvasRef" class="video-inline-canvas" />
-            <button class="fs-enter-btn" @click="enterFullscreen">
+          <div ref="videoContainerRef" class="video-container" :class="{ hidden: !!streamStatus && !streamError, fullscreen: isFullscreen }">
+            <video ref="videoRef" autoplay muted playsinline class="video-element" />
+            <button v-if="!isFullscreen" class="fs-enter-btn" @click="enterFullscreen">
               <span class="material-icons">fullscreen</span>
+            </button>
+            <button v-if="isFullscreen" class="fs-exit-btn" @click="exitFullscreen">
+              <span class="material-icons">close</span>
             </button>
           </div>
         </q-card-section>
       </q-card>
     </template>
-
-    <!-- Fullscreen overlay — teleported to body, outside Quasar layout -->
-    <Teleport to="body">
-      <div v-if="isFullscreen" ref="fsOverlayRef" class="cam-fs-overlay">
-        <canvas ref="fsCanvasRef" class="cam-fs-canvas" />
-        <button class="cam-fs-close" @click="exitFullscreen">
-          <span class="material-icons">close</span>
-        </button>
-      </div>
-    </Teleport>
   </div>
 </template>
 
@@ -216,9 +370,9 @@ function doIpeyeLogout() {
 .section-title { font-size: 0.85rem; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
 .stream-status { color: #aaa; font-size: 0.9rem; }
 
-.video-inline { position: relative; background: #000; border-radius: 0 0 8px 8px; line-height: 0; }
-.video-inline.hidden { display: none; }
-.video-inline-canvas { display: block; width: 100%; height: auto; border-radius: 0 0 8px 8px; }
+.video-container { position: relative; background: #000; border-radius: 0 0 8px 8px; line-height: 0; }
+.video-container.hidden { display: none; }
+.video-element { display: block; width: 100%; height: auto; border-radius: 0 0 8px 8px; }
 
 .fs-enter-btn {
   position: absolute; top: 8px; right: 8px;
@@ -227,27 +381,27 @@ function doIpeyeLogout() {
   display: flex; align-items: center; justify-content: center;
   opacity: 0; transition: opacity 0.2s;
 }
-.video-inline:hover .fs-enter-btn { opacity: 1; }
+.video-container:hover .fs-enter-btn { opacity: 1; }
 @media (pointer: coarse) { .fs-enter-btn { opacity: 0.7; } }
-</style>
 
-<!-- Unscoped — Teleport renders outside component scope -->
-<style>
-.cam-fs-overlay {
-  position: fixed; inset: 0; z-index: 99999;
-  background: #000;
-  display: flex; align-items: center; justify-content: center;
-}
-.cam-fs-canvas {
-  max-width: 100%; max-height: 100%;
-  width: auto; height: auto;
-}
-.cam-fs-close {
-  position: fixed; top: 16px; right: 16px; z-index: 100000;
+.fs-exit-btn {
+  position: absolute; top: 16px; right: 16px; z-index: 10;
   width: 44px; height: 44px; border-radius: 50%; border: none; cursor: pointer;
   background: rgba(255,255,255,0.15); color: #fff;
   display: flex; align-items: center; justify-content: center;
-  font-size: 0;
 }
-.cam-fs-close .material-icons { font-size: 28px; }
+.fs-exit-btn .material-icons { font-size: 28px; }
+
+.video-container:fullscreen,
+.video-container:-webkit-full-screen {
+  background: #000;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 0;
+}
+.video-container:fullscreen .video-element,
+.video-container:-webkit-full-screen .video-element {
+  max-width: 100%; max-height: 100%;
+  width: auto; height: auto;
+  border-radius: 0;
+}
 </style>
