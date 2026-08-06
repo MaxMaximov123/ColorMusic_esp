@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useAuth } from '../composables/useAuth.js'
 
 const { getToken } = useAuth()
@@ -24,8 +24,11 @@ let ws = null
 let mediaSource = null
 let sourceBuffer = null
 let initSegment = null
-let pendingBuffers = []
+let initBuffers = []
 let moofBuffer = null
+let appendQueue = []
+let hasPlayStarted = false
+let liveEdgeTimer = null
 
 const cameraOptions = computed(() =>
   cameras.value.map(c => ({ label: c.name || c.id, value: c.id }))
@@ -89,6 +92,7 @@ async function startStream() {
   if (!selectedCamera.value || !ipeyeSession.value) return
   streamError.value = ''
   streamStatus.value = 'Авторизация потока...'
+  streaming.value = true
 
   try {
     const resp = await fetch(
@@ -99,6 +103,7 @@ async function startStream() {
     if (!resp.ok) {
       streamError.value = data.error || 'Ошибка авторизации потока'
       streamStatus.value = ''
+      streaming.value = false
       return
     }
 
@@ -107,36 +112,52 @@ async function startStream() {
   } catch (err) {
     streamError.value = 'Не удалось авторизовать поток'
     streamStatus.value = ''
+    streaming.value = false
   }
 }
 
 function connectToStream(wsUrl) {
   initSegment = null
-  pendingBuffers = []
+  initBuffers = []
   moofBuffer = null
   mediaSource = null
   sourceBuffer = null
+  appendQueue = []
+  hasPlayStarted = false
 
+  console.log('[camera] connecting to', wsUrl)
   ws = new WebSocket(wsUrl)
   ws.binaryType = 'arraybuffer'
 
   ws.onopen = () => {
-    streaming.value = true
+    console.log('[camera] ws connected')
     streamStatus.value = 'Ожидание видеоданных...'
   }
 
+  let msgCount = 0
   ws.onmessage = (event) => {
-    if (typeof event.data === 'string') return
-    handleFmp4Box(new Uint8Array(event.data))
+    if (typeof event.data === 'string') {
+      console.log('[camera] text msg:', event.data)
+      return
+    }
+    const data = new Uint8Array(event.data)
+    msgCount++
+    if (msgCount <= 5) {
+      const boxType = getBoxType(data)
+      console.log(`[camera] msg#${msgCount}: ${data.length} bytes, box=${boxType}`)
+    }
+    handleFmp4Box(data)
   }
 
-  ws.onclose = () => {
+  ws.onclose = (e) => {
+    console.log('[camera] ws closed, code:', e.code)
     streaming.value = false
     streamStatus.value = ''
     cleanupMse()
   }
 
   ws.onerror = () => {
+    console.error('[camera] ws error')
     streamError.value = 'Ошибка соединения с камерой'
     streaming.value = false
     streamStatus.value = ''
@@ -153,20 +174,23 @@ function handleFmp4Box(data) {
   const boxType = getBoxType(data)
   if (!boxType) return
 
+  // Phase 1: collecting init segment (ftyp...moov)
   if (!initSegment) {
-    if (boxType === 'ftyp' || boxType === 'styp' || boxType === 'moov') {
-      if (!pendingBuffers.length && boxType !== 'ftyp') return
-      pendingBuffers.push(data)
+    if (boxType === 'ftyp' || boxType === 'styp' || boxType === 'moov' || boxType === 'free') {
+      if (!initBuffers.length && boxType !== 'ftyp') return
+      initBuffers.push(data)
 
-      if (boxType === 'moov' || (boxType === 'ftyp' && containsBox(data, 'moov'))) {
-        const total = pendingBuffers.reduce((s, b) => s + b.length, 0)
+      const hasMoov = boxType === 'moov' || containsBox(data, 'moov')
+      if (hasMoov) {
+        const total = initBuffers.reduce((s, b) => s + b.length, 0)
         initSegment = new Uint8Array(total)
         let offset = 0
-        for (const buf of pendingBuffers) {
+        for (const buf of initBuffers) {
           initSegment.set(buf, offset)
           offset += buf.length
         }
-        pendingBuffers = []
+        initBuffers = []
+        console.log('[camera] init segment ready:', total, 'bytes')
         initMse()
       }
       return
@@ -174,6 +198,7 @@ function handleFmp4Box(data) {
     return
   }
 
+  // Phase 2: media segments (moof+mdat pairs)
   if (boxType === 'moof') {
     moofBuffer = data
     return
@@ -187,52 +212,105 @@ function handleFmp4Box(data) {
     appendToSourceBuffer(segment)
     return
   }
-
-  if (boxType === 'sidx' || boxType === 'free' || boxType === 'skip' || boxType === 'mfra') {
-    return
-  }
 }
 
 function containsBox(data, type) {
-  const target = [type.charCodeAt(0), type.charCodeAt(1), type.charCodeAt(2), type.charCodeAt(3)]
+  const t0 = type.charCodeAt(0), t1 = type.charCodeAt(1), t2 = type.charCodeAt(2), t3 = type.charCodeAt(3)
   for (let i = 0; i <= data.length - 8; i++) {
-    if (data[i + 4] === target[0] && data[i + 5] === target[1] &&
-        data[i + 6] === target[2] && data[i + 7] === target[3]) return true
+    if (data[i + 4] === t0 && data[i + 5] === t1 && data[i + 6] === t2 && data[i + 7] === t3) return true
   }
   return false
+}
+
+function extractCodec(initData) {
+  // Scan for avcC box and extract profile/compat/level → codec string
+  const avcC = [0x61, 0x76, 0x63, 0x43] // 'avcC'
+  for (let i = 0; i <= initData.length - 12; i++) {
+    if (initData[i + 4] === avcC[0] && initData[i + 5] === avcC[1] &&
+        initData[i + 6] === avcC[2] && initData[i + 7] === avcC[3]) {
+      const profile = initData[i + 9]
+      const compat = initData[i + 10]
+      const level = initData[i + 11]
+      const codec = `avc1.${profile.toString(16).padStart(2, '0')}${compat.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`
+      console.log('[camera] detected codec:', codec)
+      return codec
+    }
+  }
+  // Check for hvcC (H.265)
+  const hvcC = [0x68, 0x76, 0x63, 0x43] // 'hvcC'
+  for (let i = 0; i <= initData.length - 12; i++) {
+    if (initData[i + 4] === hvcC[0] && initData[i + 5] === hvcC[1] &&
+        initData[i + 6] === hvcC[2] && initData[i + 7] === hvcC[3]) {
+      console.log('[camera] detected HEVC stream')
+      return 'hev1.1.6.L93.B0'
+    }
+  }
+  return null
+}
+
+function findSupportedMime(preferredCodec) {
+  const candidates = preferredCodec ? [preferredCodec] : []
+  candidates.push('avc1.640028', 'avc1.4d401f', 'avc1.42E01E', 'avc1.42001e')
+  for (const codec of candidates) {
+    const mime = `video/mp4; codecs="${codec}"`
+    if (MediaSource.isTypeSupported(mime)) return mime
+  }
+  return null
 }
 
 function initMse() {
   const video = videoRef.value
   if (!video || !initSegment) return
 
-  const mimeType = 'video/mp4; codecs="avc1.42E01E"'
-  if (!MediaSource.isTypeSupported(mimeType)) {
+  const detectedCodec = extractCodec(initSegment)
+  const mimeType = findSupportedMime(detectedCodec)
+
+  if (!mimeType) {
     streamError.value = 'Браузер не поддерживает воспроизведение этого формата'
     stopStream()
     return
   }
 
+  console.log('[camera] using mime:', mimeType)
   mediaSource = new MediaSource()
   video.src = URL.createObjectURL(mediaSource)
 
   mediaSource.addEventListener('sourceopen', () => {
     try {
       sourceBuffer = mediaSource.addSourceBuffer(mimeType)
-      sourceBuffer.mode = 'segments'
-      sourceBuffer.addEventListener('updateend', flushQueue)
+      sourceBuffer.mode = 'sequence'
+      sourceBuffer.addEventListener('updateend', onUpdateEnd)
+      sourceBuffer.addEventListener('error', (e) => {
+        console.error('[camera] sourceBuffer error', e)
+        streamError.value = 'Ошибка декодирования видео'
+      })
+      console.log('[camera] appending init segment')
       appendToSourceBuffer(initSegment)
-      streamStatus.value = ''
-      video.play().catch(() => {})
     } catch (err) {
+      console.error('[camera] addSourceBuffer failed:', err)
       streamError.value = 'Ошибка инициализации видео: ' + err.message
       stopStream()
     }
   })
+
+  mediaSource.addEventListener('sourceclose', () => {
+    console.log('[camera] mediaSource closed')
+  })
 }
 
-const appendQueue = []
-let isAppending = false
+function onUpdateEnd() {
+  if (!hasPlayStarted && sourceBuffer && sourceBuffer.buffered.length > 0) {
+    hasPlayStarted = true
+    streamStatus.value = ''
+    const video = videoRef.value
+    if (video) {
+      console.log('[camera] starting playback')
+      video.play().catch(() => {})
+      startLiveEdgeSeeker()
+    }
+  }
+  flushQueue()
+}
 
 function appendToSourceBuffer(data) {
   appendQueue.push(data)
@@ -241,31 +319,57 @@ function appendToSourceBuffer(data) {
 
 function flushQueue() {
   if (!sourceBuffer || sourceBuffer.updating || !appendQueue.length) return
-  if (mediaSource.readyState !== 'open') return
+  if (!mediaSource || mediaSource.readyState !== 'open') return
 
-  isAppending = true
+  // Trim old data if buffer too large (before appending)
+  if (sourceBuffer.buffered.length > 0) {
+    const start = sourceBuffer.buffered.start(0)
+    const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
+    if (end - start > 30) {
+      try {
+        sourceBuffer.remove(start, end - 10)
+        return // updateend will call flushQueue again
+      } catch {}
+    }
+  }
+
   const data = appendQueue.shift()
   try {
     sourceBuffer.appendBuffer(data)
-
-    if (sourceBuffer.buffered.length > 0) {
-      const buffered = sourceBuffer.buffered.end(0) - sourceBuffer.buffered.start(0)
-      if (buffered > 30) {
-        sourceBuffer.remove(sourceBuffer.buffered.start(0), sourceBuffer.buffered.end(0) - 10)
-      }
-    }
   } catch (err) {
+    console.error('[camera] appendBuffer error:', err.name, err.message)
     if (err.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
-      sourceBuffer.remove(sourceBuffer.buffered.start(0), sourceBuffer.buffered.end(0) - 5)
+      try {
+        sourceBuffer.remove(
+          sourceBuffer.buffered.start(0),
+          sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) - 5
+        )
+      } catch {}
     }
   }
 }
 
+function startLiveEdgeSeeker() {
+  if (liveEdgeTimer) return
+  liveEdgeTimer = setInterval(() => {
+    const video = videoRef.value
+    if (!video || !sourceBuffer || !sourceBuffer.buffered.length) return
+    const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
+    if (end - video.currentTime > 3) {
+      video.currentTime = end - 0.5
+    }
+  }, 2000)
+}
+
 function cleanupMse() {
-  appendQueue.length = 0
-  isAppending = false
+  appendQueue = []
+  hasPlayStarted = false
+  if (liveEdgeTimer) { clearInterval(liveEdgeTimer); liveEdgeTimer = null }
   if (sourceBuffer) {
-    try { mediaSource.removeSourceBuffer(sourceBuffer) } catch {}
+    try {
+      sourceBuffer.removeEventListener('updateend', onUpdateEnd)
+      mediaSource.removeSourceBuffer(sourceBuffer)
+    } catch {}
     sourceBuffer = null
   }
   if (mediaSource && mediaSource.readyState === 'open') {
@@ -346,13 +450,14 @@ function doIpeyeLogout() {
 
       <q-card v-if="streaming || streamError" dark class="section-card">
         <q-card-section class="q-pa-none">
-          <div v-if="streamStatus" class="stream-status text-center q-pa-lg">
-            <q-spinner color="primary" size="2em" class="q-mr-sm" />{{ streamStatus }}
-          </div>
           <div v-if="streamError" class="text-negative text-center q-pa-md text-caption">{{ streamError }}</div>
-          <div ref="videoContainerRef" class="video-container" :class="{ hidden: !!streamStatus && !streamError, fullscreen: isFullscreen }">
+          <div ref="videoContainerRef" class="video-container">
             <video ref="videoRef" autoplay muted playsinline class="video-element" />
-            <button v-if="!isFullscreen" class="fs-enter-btn" @click="enterFullscreen">
+            <div v-if="streamStatus" class="stream-status-overlay">
+              <q-spinner color="primary" size="2em" />
+              <div class="q-mt-sm">{{ streamStatus }}</div>
+            </div>
+            <button v-if="!isFullscreen && !streamStatus" class="fs-enter-btn" @click="enterFullscreen">
               <span class="material-icons">fullscreen</span>
             </button>
             <button v-if="isFullscreen" class="fs-exit-btn" @click="exitFullscreen">
@@ -368,11 +473,16 @@ function doIpeyeLogout() {
 <style scoped>
 .section-card { background: #1a1a2e !important; border-radius: 8px; }
 .section-title { font-size: 0.85rem; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
-.stream-status { color: #aaa; font-size: 0.9rem; }
 
-.video-container { position: relative; background: #000; border-radius: 0 0 8px 8px; line-height: 0; }
-.video-container.hidden { display: none; }
+.video-container { position: relative; background: #000; border-radius: 0 0 8px 8px; line-height: 0; min-height: 200px; }
 .video-element { display: block; width: 100%; height: auto; border-radius: 0 0 8px 8px; }
+
+.stream-status-overlay {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.85); color: #aaa; font-size: 0.9rem;
+  border-radius: 0 0 8px 8px;
+}
 
 .fs-enter-btn {
   position: absolute; top: 8px; right: 8px;
