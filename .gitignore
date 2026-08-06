@@ -9,3 +9,4 @@ server/public/
 detector/__pycache__/
 detector/*.egg-info/
 libraries/
+rtsp-proxy/wg/

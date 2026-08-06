@@ -1,7 +1,11 @@
 import os
 import asyncio
+import logging
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("rtsp-proxy")
 
 app = FastAPI()
 
@@ -14,6 +18,8 @@ for pair in os.environ.get("CAMERAS", "").split(","):
     if "=" in pair:
         name, url = pair.split("=", 1)
         CAMERAS[name.strip()] = url.strip()
+
+log.info("Cameras: %s", list(CAMERAS.keys()))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -53,11 +59,15 @@ async def stream(camera_id: str):
     if camera_id not in CAMERAS:
         return HTMLResponse("Camera not found", status_code=404)
     rtsp_url = CAMERAS[camera_id]
+    log.info("Starting stream for %s", camera_id)
 
     async def generate():
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
             "-rtsp_transport", "tcp",
+            "-stimeout", "5000000",
+            "-analyzeduration", "2000000",
+            "-probesize", "1000000",
             "-fflags", "+genpts+discardcorrupt+nobuffer",
             "-flags", "low_delay",
             "-i", rtsp_url,
@@ -67,13 +77,22 @@ async def stream(camera_id: str):
             "-r", str(MAX_FPS),
             "-",
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
+
+        async def log_stderr():
+            async for line in proc.stderr:
+                log.info("ffmpeg: %s", line.decode(errors="replace").rstrip())
+
+        stderr_task = asyncio.create_task(log_stderr())
+
         buf = b""
+        frames = 0
         try:
             while True:
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
+                    log.warning("ffmpeg stdout closed for %s after %d frames", camera_id, frames)
                     break
                 buf += chunk
                 while True:
@@ -87,6 +106,9 @@ async def stream(camera_id: str):
                         break
                     frame = buf[soi : eoi + 2]
                     buf = buf[eoi + 2 :]
+                    frames += 1
+                    if frames == 1:
+                        log.info("First frame received for %s (%d bytes)", camera_id, len(frame))
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
@@ -94,6 +116,8 @@ async def stream(camera_id: str):
         finally:
             proc.kill()
             await proc.wait()
+            stderr_task.cancel()
+            log.info("Stream ended for %s, total frames: %d", camera_id, frames)
 
     return StreamingResponse(
         generate(), media_type="multipart/x-mixed-replace; boundary=frame"

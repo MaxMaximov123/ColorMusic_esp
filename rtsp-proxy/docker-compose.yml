@@ -23,6 +23,6 @@ services:
     restart: unless-stopped
     environment:
       # камеры: имя=rtsp://url через запятую
-      - CAMERAS=cam1=rtsp://192.168.1.100:554/stream1,cam2=rtsp://192.168.1.101:554/stream1
+      - CAMERAS=cam1=rtsp://admin:61746723D@192.168.1.2:554/10
       - JPEG_QUALITY=5
       - MAX_FPS=15
