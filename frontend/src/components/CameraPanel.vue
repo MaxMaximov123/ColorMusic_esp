@@ -137,6 +137,10 @@ function connectToStream(wsUrl) {
   ws = new WebSocket(wsUrl)
   ws.binaryType = 'arraybuffer'
 
+  let totalMsgs = 0
+  let totalBytes = 0
+  let firstHex = ''
+
   ws.onopen = () => {
     console.log('[camera] ws connected')
     streamStatus.value = 'Ожидание видеоданных...'
@@ -147,7 +151,23 @@ function connectToStream(wsUrl) {
       console.log('[camera] text msg:', event.data)
       return
     }
-    feedParser(new Uint8Array(event.data))
+    const data = new Uint8Array(event.data)
+    totalMsgs++
+    totalBytes += data.length
+
+    if (totalMsgs === 1) {
+      firstHex = Array.from(data.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')
+      console.log(`[camera] msg#1: ${data.length} bytes, hex: ${firstHex}`)
+    }
+    if (totalMsgs <= 5) {
+      console.log(`[camera] msg#${totalMsgs}: ${data.length} bytes`)
+    }
+
+    if (!initSegment) {
+      streamStatus.value = `${totalMsgs} сообщ, ${(totalBytes/1024).toFixed(0)}KB, боксов:${boxCount} | ${firstHex}`
+    }
+
+    feedParser(data)
   }
 
   ws.onclose = (e) => {
@@ -189,8 +209,14 @@ function feedParser(incoming) {
 
   // Parse complete boxes
   let offset = 0
-  while (offset + 8 <= streamBuf.length) {
+  let loopGuard = 0
+  while (offset + 8 <= streamBuf.length && loopGuard++ < 1000) {
     const size = readU32(streamBuf, offset)
+    const type = boxType(streamBuf, offset)
+
+    if (loopGuard <= 3) {
+      console.log(`[parser] offset=${offset} size=${size} type=${type} bufLen=${streamBuf.length}`)
+    }
 
     // Extended size (64-bit) — read lower 32 bits
     if (size === 1 && offset + 16 <= streamBuf.length) {
@@ -202,14 +228,26 @@ function feedParser(incoming) {
       continue
     }
 
+    if (size === 0) {
+      // Box extends to end of data — treat remaining data as one box
+      const box = streamBuf.slice(offset)
+      processBox(box)
+      offset = streamBuf.length
+      break
+    }
+
     if (size < 8) {
-      // Invalid: skip one byte and resync
-      console.warn('[camera] invalid box size', size, 'at offset', offset)
+      console.warn('[parser] invalid box size', size, 'at offset', offset, 'skipping byte')
       offset++
       continue
     }
 
-    if (offset + size > streamBuf.length) break // incomplete box, wait
+    if (offset + size > streamBuf.length) {
+      if (loopGuard <= 3) {
+        console.log(`[parser] incomplete box: need ${size}, have ${streamBuf.length - offset}`)
+      }
+      break
+    }
 
     const box = streamBuf.slice(offset, offset + size)
     processBox(box)
