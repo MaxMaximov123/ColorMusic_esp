@@ -28,12 +28,12 @@ let appendQueue = []
 let hasPlayStarted = false
 let liveEdgeTimer = null
 
-// Streaming box parser state
-let streamBuf = new Uint8Array(0)
-let parserPhase = 'init' // 'init' | 'streaming'
-let initParts = []
-let moofParts = []
-let boxCount = 0
+// fMP4 box state (each WS message = one box, like in the Python reference)
+let gotMoov = false
+let initBufs = []
+let moofBuf = null
+
+const VALID_BOXES = new Set(['ftyp', 'styp', 'moov', 'moof', 'mdat', 'sidx', 'free', 'skip', 'mfra'])
 
 const cameraOptions = computed(() =>
   cameras.value.map(c => ({ label: c.name || c.id, value: c.id }))
@@ -127,19 +127,16 @@ function connectToStream(wsUrl) {
   sourceBuffer = null
   appendQueue = []
   hasPlayStarted = false
-  streamBuf = new Uint8Array(0)
-  parserPhase = 'init'
-  initParts = []
-  moofParts = []
-  boxCount = 0
+  gotMoov = false
+  initBufs = []
+  moofBuf = null
 
   console.log('[camera] connecting to', wsUrl)
   ws = new WebSocket(wsUrl)
   ws.binaryType = 'arraybuffer'
 
-  let totalMsgs = 0
-  let totalBytes = 0
-  let firstHex = ''
+  let msgCount = 0
+  let byteCount = 0
 
   ws.onopen = () => {
     console.log('[camera] ws connected')
@@ -148,26 +145,75 @@ function connectToStream(wsUrl) {
 
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {
-      console.log('[camera] text msg:', event.data)
+      console.log('[camera] text:', event.data)
       return
     }
-    const data = new Uint8Array(event.data)
-    totalMsgs++
-    totalBytes += data.length
+    const msg = new Uint8Array(event.data)
+    msgCount++
+    byteCount += msg.length
 
-    if (totalMsgs === 1) {
-      firstHex = Array.from(data.slice(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')
-      console.log(`[camera] msg#1: ${data.length} bytes, hex: ${firstHex}`)
-    }
-    if (totalMsgs <= 5) {
-      console.log(`[camera] msg#${totalMsgs}: ${data.length} bytes`)
+    if (msgCount <= 5) {
+      const hex = Array.from(msg.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')
+      console.log(`[camera] msg#${msgCount}: ${msg.length} bytes, hex: ${hex}`)
     }
 
+    // Skip tiny messages (keepalive/ping)
+    if (msg.length < 8) return
+
+    const type = String.fromCharCode(msg[4], msg[5], msg[6], msg[7])
+
+    // Show diagnostics while waiting for init
     if (!initSegment) {
-      streamStatus.value = `${totalMsgs} сообщ, ${(totalBytes/1024).toFixed(0)}KB, боксов:${boxCount} | ${firstHex}`
+      streamStatus.value = `${msgCount} msg, ${(byteCount / 1024).toFixed(0)}KB | box=${type} (${msg.length}b)`
     }
 
-    feedParser(data)
+    if (!VALID_BOXES.has(type)) {
+      if (msgCount <= 10) console.log(`[camera] unknown box type: ${type}`)
+      return
+    }
+
+    // Phase 1: assemble init segment (ftyp + moov)
+    if (!gotMoov) {
+      if (type === 'ftyp') {
+        initBufs = [msg]
+        // ftyp+moov can arrive in a single message
+        if (containsSubstring(msg, 'moov')) {
+          gotMoov = true
+          console.log(`[camera] ftyp+moov in one message: ${msg.length} bytes`)
+          assembleInitSegment()
+        } else {
+          console.log(`[camera] ftyp: ${msg.length} bytes, waiting for moov...`)
+        }
+        return
+      }
+      if (type === 'moov') {
+        initBufs.push(msg)
+        gotMoov = true
+        console.log(`[camera] moov: ${msg.length} bytes, total init: ${initBufs.reduce((s, b) => s + b.length, 0)} bytes`)
+        assembleInitSegment()
+        return
+      }
+      if (type === 'styp') {
+        if (initBufs.length > 0) initBufs.push(msg)
+        return
+      }
+      return
+    }
+
+    // Phase 2: media segments (moof+mdat pairs for MSE)
+    if (type === 'moof') {
+      moofBuf = msg
+      return
+    }
+    if (type === 'mdat' && moofBuf) {
+      const segment = new Uint8Array(moofBuf.length + msg.length)
+      segment.set(moofBuf, 0)
+      segment.set(msg, moofBuf.length)
+      moofBuf = null
+      appendToSourceBuffer(segment)
+      return
+    }
+    // sidx, free, skip, mfra — ignore
   }
 
   ws.onclose = (e) => {
@@ -186,142 +232,25 @@ function connectToStream(wsUrl) {
   }
 }
 
-// ── Streaming fMP4 box parser ──
-
-function readU32(data, off) {
-  return ((data[off] << 24) | (data[off + 1] << 16) | (data[off + 2] << 8) | data[off + 3]) >>> 0
+function containsSubstring(data, str) {
+  const t0 = str.charCodeAt(0), t1 = str.charCodeAt(1), t2 = str.charCodeAt(2), t3 = str.charCodeAt(3)
+  for (let i = 0; i <= data.length - 4; i++) {
+    if (data[i] === t0 && data[i + 1] === t1 && data[i + 2] === t2 && data[i + 3] === t3) return true
+  }
+  return false
 }
 
-function boxType(data, off) {
-  return String.fromCharCode(data[off + 4], data[off + 5], data[off + 6], data[off + 7])
-}
-
-function feedParser(incoming) {
-  // Append to stream buffer
-  if (streamBuf.length === 0) {
-    streamBuf = incoming
-  } else {
-    const combined = new Uint8Array(streamBuf.length + incoming.length)
-    combined.set(streamBuf)
-    combined.set(incoming, streamBuf.length)
-    streamBuf = combined
+function assembleInitSegment() {
+  const total = initBufs.reduce((s, b) => s + b.length, 0)
+  initSegment = new Uint8Array(total)
+  let off = 0
+  for (const buf of initBufs) {
+    initSegment.set(buf, off)
+    off += buf.length
   }
-
-  // Parse complete boxes
-  let offset = 0
-  let loopGuard = 0
-  while (offset + 8 <= streamBuf.length && loopGuard++ < 1000) {
-    const size = readU32(streamBuf, offset)
-    const type = boxType(streamBuf, offset)
-
-    if (loopGuard <= 3) {
-      console.log(`[parser] offset=${offset} size=${size} type=${type} bufLen=${streamBuf.length}`)
-    }
-
-    // Extended size (64-bit) — read lower 32 bits
-    if (size === 1 && offset + 16 <= streamBuf.length) {
-      const extSize = readU32(streamBuf, offset + 12)
-      if (offset + extSize > streamBuf.length) break
-      const box = streamBuf.slice(offset, offset + extSize)
-      processBox(box)
-      offset += extSize
-      continue
-    }
-
-    if (size === 0) {
-      // Box extends to end of data — treat remaining data as one box
-      const box = streamBuf.slice(offset)
-      processBox(box)
-      offset = streamBuf.length
-      break
-    }
-
-    if (size < 8) {
-      console.warn('[parser] invalid box size', size, 'at offset', offset, 'skipping byte')
-      offset++
-      continue
-    }
-
-    if (offset + size > streamBuf.length) {
-      if (loopGuard <= 3) {
-        console.log(`[parser] incomplete box: need ${size}, have ${streamBuf.length - offset}`)
-      }
-      break
-    }
-
-    const box = streamBuf.slice(offset, offset + size)
-    processBox(box)
-    offset += size
-  }
-
-  // Keep leftover
-  if (offset > 0) {
-    streamBuf = offset < streamBuf.length ? streamBuf.slice(offset) : new Uint8Array(0)
-  }
-}
-
-function processBox(box) {
-  const type = boxType(box, 0)
-  boxCount++
-
-  if (boxCount <= 10) {
-    console.log(`[camera] box#${boxCount}: type=${type} size=${box.length}`)
-  }
-
-  if (parserPhase === 'init') {
-    // Collect ftyp + optional (styp, free, skip, sidx) + moov
-    if (type === 'ftyp' || type === 'styp' || type === 'free' || type === 'skip' || type === 'sidx') {
-      if (type === 'ftyp' || initParts.length > 0) {
-        initParts.push(box)
-      }
-      return
-    }
-    if (type === 'moov') {
-      if (initParts.length === 0) {
-        // moov without ftyp — create minimal ftyp
-        console.warn('[camera] moov received without ftyp, using moov alone')
-      }
-      initParts.push(box)
-      // Assemble init segment
-      const total = initParts.reduce((s, b) => s + b.length, 0)
-      initSegment = new Uint8Array(total)
-      let off = 0
-      for (const part of initParts) {
-        initSegment.set(part, off)
-        off += part.length
-      }
-      initParts = []
-      parserPhase = 'streaming'
-      console.log('[camera] init segment ready:', total, 'bytes')
-      initMse()
-      return
-    }
-    // Unknown box during init — skip
-    if (boxCount <= 10) console.log('[camera] skipping box during init:', type)
-    return
-  }
-
-  // Streaming phase: assemble moof+mdat media segments
-  if (type === 'moof') {
-    moofParts = [box]
-    return
-  }
-  if (type === 'mdat') {
-    if (moofParts.length > 0) {
-      moofParts.push(box)
-      const total = moofParts.reduce((s, b) => s + b.length, 0)
-      const segment = new Uint8Array(total)
-      let off = 0
-      for (const part of moofParts) {
-        segment.set(part, off)
-        off += part.length
-      }
-      moofParts = []
-      appendToSourceBuffer(segment)
-    }
-    return
-  }
-  // styp between segments is OK, sidx/free/skip — ignore
+  initBufs = []
+  console.log('[camera] init segment ready:', total, 'bytes')
+  initMse()
 }
 
 function extractCodec(initData) {
