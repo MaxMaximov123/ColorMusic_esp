@@ -23,17 +23,10 @@ const videoContainerRef = ref(null)
 let ws = null
 let mediaSource = null
 let sourceBuffer = null
-let initSegment = null
 let appendQueue = []
-let hasPlayStarted = false
+let streamingStarted = false
 let liveEdgeTimer = null
-
-// fMP4 box state (each WS message = one box, like in the Python reference)
-let gotMoov = false
-let initBufs = []
-let moofBuf = null
-
-const VALID_BOXES = new Set(['ftyp', 'styp', 'moov', 'moof', 'mdat', 'sidx', 'free', 'skip', 'mfra'])
+let gopDecode = null
 
 const cameraOptions = computed(() =>
   cameras.value.map(c => ({ label: c.name || c.id, value: c.id }))
@@ -105,25 +98,50 @@ function startStream() {
 }
 
 function connectToStream(wsUrl) {
-  initSegment = null
-  mediaSource = null
   sourceBuffer = null
   appendQueue = []
-  hasPlayStarted = false
-  gotMoov = false
-  initBufs = []
-  moofBuf = null
+  streamingStarted = false
+  gopDecode = null
+
+  const video = videoRef.value
+  if (!video) return
+
+  const MSrc = window.ManagedMediaSource || window.MediaSource
+  mediaSource = new MSrc()
+  video.src = URL.createObjectURL(mediaSource)
+
+  let sourceOpen = false
+  let pendingCodec = null
+
+  mediaSource.addEventListener('sourceopen', () => {
+    sourceOpen = true
+    if (pendingCodec) createSourceBuffer(pendingCodec)
+  })
+
+  function createSourceBuffer(codecStr) {
+    if (sourceBuffer) return
+    const mimeType = `video/mp4; codecs="${codecStr}"`
+    if (!MSrc.isTypeSupported(mimeType)) {
+      streamError.value = 'Браузер не поддерживает кодек: ' + codecStr
+      stopStream()
+      return
+    }
+    console.log('[camera] codec:', codecStr, '→', mimeType)
+    sourceBuffer = mediaSource.addSourceBuffer(mimeType)
+    sourceBuffer.mode = 'segments'
+    mediaSource.duration = Infinity
+    sourceBuffer.addEventListener('updateend', onUpdateEnd)
+    sourceBuffer.addEventListener('error', () => {
+      streamError.value = 'Ошибка декодирования видео'
+    })
+  }
 
   console.log('[camera] connecting to', wsUrl)
   ws = new WebSocket(wsUrl)
   ws.binaryType = 'arraybuffer'
 
-  let msgCount = 0
-  let byteCount = 0
-
   ws.onopen = () => {
     console.log('[camera] ws connected')
-    streamStatus.value = 'Ожидание видеоданных...'
   }
 
   ws.onmessage = (event) => {
@@ -143,72 +161,27 @@ function connectToStream(wsUrl) {
       }
       return
     }
-    const msg = new Uint8Array(event.data)
-    msgCount++
-    byteCount += msg.length
 
-    if (msgCount <= 5) {
-      const hex = Array.from(msg.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')
-      console.log(`[camera] msg#${msgCount}: ${msg.length} bytes, hex: ${hex}`)
-    }
+    const data = new Uint8Array(event.data)
 
-    // Skip tiny messages (keepalive/ping)
-    if (msg.length < 8) return
-
-    const type = String.fromCharCode(msg[4], msg[5], msg[6], msg[7])
-
-    // Show diagnostics while waiting for init
-    if (!initSegment) {
-      streamStatus.value = `${msgCount} msg, ${(byteCount / 1024).toFixed(0)}KB | box=${type} (${msg.length}b)`
-    }
-
-    if (!VALID_BOXES.has(type)) {
-      if (msgCount <= 10) console.log(`[camera] unknown box type: ${type}`)
-      return
-    }
-
-    // Phase 1: assemble init segment (ftyp + moov)
-    if (!gotMoov) {
-      if (type === 'ftyp') {
-        initBufs = [msg]
-        // ftyp+moov can arrive in a single message
-        if (containsSubstring(msg, 'moov')) {
-          gotMoov = true
-          console.log(`[camera] ftyp+moov in one message: ${msg.length} bytes`)
-          assembleInitSegment()
-        } else {
-          console.log(`[camera] ftyp: ${msg.length} bytes, waiting for moov...`)
-        }
-        return
-      }
-      if (type === 'moov') {
-        initBufs.push(msg)
-        gotMoov = true
-        console.log(`[camera] moov: ${msg.length} bytes, total init: ${initBufs.reduce((s, b) => s + b.length, 0)} bytes`)
-        assembleInitSegment()
-        return
-      }
-      if (type === 'styp') {
-        if (initBufs.length > 0) initBufs.push(msg)
-        return
+    if (data[0] === 6) {
+      const codecStr = new TextDecoder().decode(data.slice(1))
+      console.log('[camera] received codec:', codecStr)
+      if (sourceOpen) {
+        createSourceBuffer(codecStr)
+      } else {
+        pendingCodec = codecStr
       }
       return
     }
 
-    // Phase 2: media segments (moof+mdat pairs for MSE)
-    if (type === 'moof') {
-      moofBuf = msg
-      return
+    if (!sourceBuffer) return
+
+    pushPacket(event.data)
+
+    if (video.paused) {
+      video.play().catch(() => {})
     }
-    if (type === 'mdat' && moofBuf) {
-      const segment = new Uint8Array(moofBuf.length + msg.length)
-      segment.set(moofBuf, 0)
-      segment.set(msg, moofBuf.length)
-      moofBuf = null
-      appendToSourceBuffer(segment)
-      return
-    }
-    // sidx, free, skip, mfra — ignore
   }
 
   ws.onclose = (e) => {
@@ -227,152 +200,72 @@ function connectToStream(wsUrl) {
   }
 }
 
-function containsSubstring(data, str) {
-  const t0 = str.charCodeAt(0), t1 = str.charCodeAt(1), t2 = str.charCodeAt(2), t3 = str.charCodeAt(3)
-  for (let i = 0; i <= data.length - 4; i++) {
-    if (data[i] === t0 && data[i + 1] === t1 && data[i + 2] === t2 && data[i + 3] === t3) return true
-  }
-  return false
-}
-
-function assembleInitSegment() {
-  const total = initBufs.reduce((s, b) => s + b.length, 0)
-  initSegment = new Uint8Array(total)
-  let off = 0
-  for (const buf of initBufs) {
-    initSegment.set(buf, off)
-    off += buf.length
-  }
-  initBufs = []
-  console.log('[camera] init segment ready:', total, 'bytes')
-  initMse()
-}
-
-function extractCodec(initData) {
-  // Scan for avcC box and extract profile/compat/level → codec string
-  const avcC = [0x61, 0x76, 0x63, 0x43] // 'avcC'
-  for (let i = 0; i <= initData.length - 12; i++) {
-    if (initData[i + 4] === avcC[0] && initData[i + 5] === avcC[1] &&
-        initData[i + 6] === avcC[2] && initData[i + 7] === avcC[3]) {
-      const profile = initData[i + 9]
-      const compat = initData[i + 10]
-      const level = initData[i + 11]
-      const codec = `avc1.${profile.toString(16).padStart(2, '0')}${compat.toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`
-      console.log('[camera] detected codec:', codec)
-      return codec
-    }
-  }
-  // Check for hvcC (H.265)
-  const hvcC = [0x68, 0x76, 0x63, 0x43] // 'hvcC'
-  for (let i = 0; i <= initData.length - 12; i++) {
-    if (initData[i + 4] === hvcC[0] && initData[i + 5] === hvcC[1] &&
-        initData[i + 6] === hvcC[2] && initData[i + 7] === hvcC[3]) {
-      console.log('[camera] detected HEVC stream')
-      return 'hev1.1.6.L93.B0'
-    }
-  }
-  return null
-}
-
-function findSupportedMime(preferredCodec) {
-  const candidates = preferredCodec ? [preferredCodec] : []
-  candidates.push('avc1.640028', 'avc1.4d401f', 'avc1.42E01E', 'avc1.42001e')
-  for (const codec of candidates) {
-    const mime = `video/mp4; codecs="${codec}"`
-    if (MediaSource.isTypeSupported(mime)) return mime
-  }
-  return null
-}
-
-function initMse() {
-  const video = videoRef.value
-  if (!video || !initSegment) return
-
-  const detectedCodec = extractCodec(initSegment)
-  const mimeType = findSupportedMime(detectedCodec)
-
-  if (!mimeType) {
-    streamError.value = 'Браузер не поддерживает воспроизведение этого формата'
-    stopStream()
-    return
-  }
-
-  console.log('[camera] using mime:', mimeType)
-  mediaSource = new MediaSource()
-  video.src = URL.createObjectURL(mediaSource)
-
-  mediaSource.addEventListener('sourceopen', () => {
+function pushPacket(packet) {
+  const view = new Uint8Array(packet)
+  if (!streamingStarted && !sourceBuffer.updating) {
     try {
-      sourceBuffer = mediaSource.addSourceBuffer(mimeType)
-      sourceBuffer.mode = 'sequence'
-      sourceBuffer.addEventListener('updateend', onUpdateEnd)
-      sourceBuffer.addEventListener('error', (e) => {
-        console.error('[camera] sourceBuffer error', e)
-        streamError.value = 'Ошибка декодирования видео'
-      })
-      console.log('[camera] appending init segment')
-      appendToSourceBuffer(initSegment)
+      sourceBuffer.appendBuffer(view)
+      streamingStarted = true
     } catch (err) {
-      console.error('[camera] addSourceBuffer failed:', err)
-      streamError.value = 'Ошибка инициализации видео: ' + err.message
+      console.error('[camera] appendBuffer error:', err.message)
+      streamError.value = 'Ошибка буфера видео'
       stopStream()
     }
-  })
+    return
+  }
+  appendQueue.push(view)
+  if (!sourceBuffer.updating) loadPacket()
+}
 
-  mediaSource.addEventListener('sourceclose', () => {
-    console.log('[camera] mediaSource closed')
-  })
+function loadPacket() {
+  if (!sourceBuffer || sourceBuffer.updating) return
+  if (appendQueue.length > 0) {
+    try {
+      sourceBuffer.appendBuffer(appendQueue.shift())
+    } catch (err) {
+      console.error('[camera] appendBuffer error:', err.message)
+      stopStream()
+    }
+  } else {
+    streamingStarted = false
+  }
 }
 
 function onUpdateEnd() {
-  if (!hasPlayStarted && sourceBuffer && sourceBuffer.buffered.length > 0) {
-    hasPlayStarted = true
-    streamStatus.value = ''
-    const video = videoRef.value
-    if (video) {
-      console.log('[camera] starting playback')
-      video.play().catch(() => {})
+  if (!sourceBuffer) return
+
+  if (sourceBuffer.buffered.length > 0) {
+    const range = sourceBuffer.buffered.length - 1
+    const bufferedEnd = sourceBuffer.buffered.end(range)
+
+    if (streamStatus.value) {
+      streamStatus.value = ''
       startLiveEdgeSeeker()
     }
-  }
-  flushQueue()
-}
 
-function appendToSourceBuffer(data) {
-  appendQueue.push(data)
-  flushQueue()
-}
+    if (gopDecode === null && videoRef.value) {
+      gopDecode = Math.abs(bufferedEnd - videoRef.value.currentTime)
+    }
 
-function flushQueue() {
-  if (!sourceBuffer || sourceBuffer.updating || !appendQueue.length) return
-  if (!mediaSource || mediaSource.readyState !== 'open') return
+    const video = videoRef.value
+    if (video) {
+      const avgBuf = gopDecode !== null ? Math.max(gopDecode, 0.9) : 2
+      if (bufferedEnd - video.currentTime >= avgBuf * 3) {
+        video.currentTime = bufferedEnd - avgBuf * 1.5
+      }
+    }
 
-  // Trim old data if buffer too large (before appending)
-  if (sourceBuffer.buffered.length > 0) {
+    // Trim old buffer
     const start = sourceBuffer.buffered.start(0)
-    const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
-    if (end - start > 30) {
+    if (bufferedEnd - start > 30) {
       try {
-        sourceBuffer.remove(start, end - 10)
-        return // updateend will call flushQueue again
+        sourceBuffer.remove(start, bufferedEnd - 10)
+        return
       } catch {}
     }
   }
 
-  const data = appendQueue.shift()
-  try {
-    sourceBuffer.appendBuffer(data)
-  } catch (err) {
-    console.error('[camera] appendBuffer error:', err.name, err.message)
-    if (err.name === 'QuotaExceededError' && sourceBuffer.buffered.length > 0) {
-      try {
-        sourceBuffer.remove(
-          sourceBuffer.buffered.start(0),
-          sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) - 5
-        )
-      } catch {}
-    }
-  }
+  loadPacket()
 }
 
 function startLiveEdgeSeeker() {
@@ -381,20 +274,22 @@ function startLiveEdgeSeeker() {
     const video = videoRef.value
     if (!video || !sourceBuffer || !sourceBuffer.buffered.length) return
     const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
-    if (end - video.currentTime > 3) {
-      video.currentTime = end - 0.5
+    const avgBuf = gopDecode !== null ? Math.max(gopDecode, 0.9) : 2
+    if (end - video.currentTime > avgBuf * 3) {
+      video.currentTime = end - avgBuf * 1.5
     }
-  }, 2000)
+  }, 3000)
 }
 
 function cleanupMse() {
   appendQueue = []
-  hasPlayStarted = false
+  streamingStarted = false
+  gopDecode = null
   if (liveEdgeTimer) { clearInterval(liveEdgeTimer); liveEdgeTimer = null }
   if (sourceBuffer) {
     try {
       sourceBuffer.removeEventListener('updateend', onUpdateEnd)
-      mediaSource.removeSourceBuffer(sourceBuffer)
+      if (mediaSource && mediaSource.readyState === 'open') mediaSource.removeSourceBuffer(sourceBuffer)
     } catch {}
     sourceBuffer = null
   }
