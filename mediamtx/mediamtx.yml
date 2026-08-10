@@ -1,0 +1,38 @@
+###############################################
+# MediaMTX — RTSP relay for IP cameras
+# Docs: https://github.com/bluenviron/mediamtx
+#
+# VLC: rtsp://<tailscale-ip>:8554/<path>
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+
+# RTSP server
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp]
+
+# Disable unused protocols
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+record: no
+
+# Defaults for all paths
+pathDefaults:
+  sourceOnDemand: yes
+  sourceOnDemandCloseAfter: 30s
+  readTimeout: 10s
+  writeTimeout: 10s
+
+paths:
+  cam1:
+    source: rtsp://admin:61746723D@192.168.1.2:554/10
+  cam2:
+    source: rtsp://admin:61746723D@192.168.1.2:554/20
+  # cam3:
+  #   source: rtsp://admin:61746723D@192.168.1.2:554/30
+  # cam4:
+  #   source: rtsp://admin:61746723D@192.168.1.2:554/40
