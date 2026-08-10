@@ -22,3 +22,6 @@ CREATE TABLE IF NOT EXISTS temperature_history (
 
 CREATE INDEX IF NOT EXISTS idx_temp_device_time
   ON temperature_history(device_id, recorded_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_temp_recorded_at
+  ON temperature_history(recorded_at DESC);

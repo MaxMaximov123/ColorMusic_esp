@@ -93,32 +93,15 @@ async function doIpeyeLogin() {
 
 function toggleStream() { streaming.value ? stopStream() : startStream() }
 
-async function startStream() {
+function startStream() {
   if (!selectedCamera.value || !ipeyeSession.value) return
   streamError.value = ''
-  streamStatus.value = 'Авторизация потока...'
+  streamStatus.value = 'Подключение...'
   streaming.value = true
 
-  try {
-    const resp = await fetch(
-      `/api/ipeye/authorize/${selectedCamera.value}?session=${encodeURIComponent(ipeyeSession.value)}`,
-      { headers: { 'Authorization': `Bearer ${getToken()}` } }
-    )
-    const data = await resp.json()
-    if (!resp.ok) {
-      streamError.value = data.error || 'Ошибка авторизации потока'
-      streamStatus.value = ''
-      streaming.value = false
-      return
-    }
-
-    streamStatus.value = 'Подключение к камере...'
-    connectToStream(data.wsUrl)
-  } catch (err) {
-    streamError.value = 'Не удалось авторизовать поток'
-    streamStatus.value = ''
-    streaming.value = false
-  }
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const wsUrl = `${protocol}//${location.host}/ws/camera?session=${encodeURIComponent(ipeyeSession.value)}&camera=${encodeURIComponent(selectedCamera.value)}&token=${encodeURIComponent(getToken())}`
+  connectToStream(wsUrl)
 }
 
 function connectToStream(wsUrl) {
@@ -145,7 +128,19 @@ function connectToStream(wsUrl) {
 
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {
-      console.log('[camera] text:', event.data)
+      try {
+        const msg = JSON.parse(event.data)
+        if (msg.error) {
+          streamError.value = msg.error
+          stopStream()
+          return
+        }
+        if (msg.status === 'connected') {
+          streamStatus.value = 'Ожидание видеоданных...'
+        }
+      } catch {
+        console.log('[camera] text:', event.data)
+      }
       return
     }
     const msg = new Uint8Array(event.data)

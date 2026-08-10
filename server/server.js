@@ -2,6 +2,7 @@ const http = require('http');
 const express = require('express');
 const path = require('path');
 const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const url = require('url');
@@ -82,6 +83,13 @@ async function initDB() {
       t.timestamp('updated_at').defaultTo(db.fn.now());
     });
   }
+
+  await db.raw(`
+    CREATE INDEX IF NOT EXISTS idx_temp_device_time
+      ON temperature_history(device_id, recorded_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_temp_recorded_at
+      ON temperature_history(recorded_at DESC)
+  `).catch(() => {});
 
   const admin = await db('users').where('username', ADMIN_USER).first();
   if (!admin) {
@@ -362,6 +370,7 @@ app.get('*', (req, res) => {
 // ── State ──
 
 const devices = new Map();
+const lastTempWrite = new Map();
 const clients = new Set();
 
 function buildDeviceList() {
@@ -388,6 +397,7 @@ function sendJson(ws, obj) {
 const server = http.createServer(app);
 const wssDevice = new WebSocketServer({ noServer: true });
 const wssClient = new WebSocketServer({ noServer: true });
+const wssCamera = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
@@ -409,6 +419,21 @@ server.on('upgrade', (req, socket, head) => {
       return;
     }
     wssClient.handleUpgrade(req, socket, head, ws => wssClient.emit('connection', ws, req));
+    return;
+  }
+
+  if (pathname === '/ws/camera') {
+    const token = query.token;
+    if (!token) { socket.destroy(); return; }
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch {
+      wssCamera.handleUpgrade(req, socket, head, ws => {
+        ws.close(4001, 'Token expired');
+      });
+      return;
+    }
+    wssCamera.handleUpgrade(req, socket, head, ws => wssCamera.emit('connection', ws, req));
     return;
   }
 
@@ -459,9 +484,14 @@ wssDevice.on('connection', (ws, req) => {
         dev.state = { ...dev.state, ...msg.state };
 
         if (dev.deviceType === 'tempsensor' && msg.state.temp !== undefined) {
-          db('temperature_history')
-            .insert({ device_id: deviceId, temperature: msg.state.temp })
-            .catch(err => console.error('[db]', err.message));
+          const now = Date.now();
+          const lastWrite = lastTempWrite.get(deviceId) || 0;
+          if (now - lastWrite >= 600_000) {
+            lastTempWrite.set(deviceId, now);
+            db('temperature_history')
+              .insert({ device_id: deviceId, temperature: msg.state.temp })
+              .catch(err => console.error('[db]', err.message));
+          }
         }
 
         db('devices')
@@ -544,6 +574,84 @@ wssClient.on('connection', (ws, req) => {
   ws.on('error', (err) => console.log('[client] error:', err.message));
 });
 
+// ── Camera WS proxy ──
+
+wssCamera.on('connection', (clientWs, req) => {
+  const { session, camera } = url.parse(req.url, true).query;
+
+  clientWs.isAlive = true;
+  clientWs.on('pong', () => { clientWs.isAlive = true; });
+
+  if (!session || !camera || !ipeyeSessions.has(session)) {
+    clientWs.send(JSON.stringify({ error: 'Invalid session' }));
+    clientWs.close();
+    return;
+  }
+
+  const client = ipeyeSessions.get(session);
+  console.log('[camera-proxy] authorizing stream', camera);
+
+  client.authorizeStream(camera).then(wsServer => {
+    if (!wsServer) {
+      clientWs.send(JSON.stringify({ error: 'Failed to authorize stream' }));
+      clientWs.close();
+      return;
+    }
+
+    const wsUrl = `wss://${wsServer}/ws/mp4/live?name=${camera}`;
+    console.log('[camera-proxy] connecting to', wsUrl);
+
+    const ipeyeWs = new WebSocket(wsUrl, {
+      headers: {
+        'User-Agent': IPEYE_UA,
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Accept-Language': 'ru',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+      origin: IPEYE_SITE,
+    });
+
+    ipeyeWs.on('open', () => {
+      console.log('[camera-proxy] IPeye connected');
+      if (clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({ status: 'connected' }));
+      }
+    });
+
+    ipeyeWs.on('message', (data, isBinary) => {
+      if (clientWs.readyState === 1) {
+        clientWs.send(data, { binary: isBinary });
+      }
+    });
+
+    clientWs.on('close', () => {
+      console.log('[camera-proxy] client disconnected');
+      ipeyeWs.close();
+    });
+
+    ipeyeWs.on('close', () => {
+      if (clientWs.readyState === 1) clientWs.close();
+    });
+
+    ipeyeWs.on('error', (err) => {
+      console.error('[camera-proxy] IPeye error:', err.message);
+      if (clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({ error: 'IPeye connection error' }));
+        clientWs.close();
+      }
+    });
+
+    clientWs.on('error', () => ipeyeWs.close());
+  }).catch(err => {
+    console.error('[camera-proxy] auth error:', err.message);
+    if (clientWs.readyState === 1) {
+      clientWs.send(JSON.stringify({ error: 'Authorization failed' }));
+      clientWs.close();
+    }
+  });
+});
+
 // ── Keepalive ──
 
 const pingTimer = setInterval(() => {
@@ -553,6 +661,11 @@ const pingTimer = setInterval(() => {
     ws.ping();
   }
   for (const ws of wssClient.clients) {
+    if (!ws.isAlive) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    ws.ping();
+  }
+  for (const ws of wssCamera.clients) {
     if (!ws.isAlive) { ws.terminate(); continue; }
     ws.isAlive = false;
     ws.ping();
