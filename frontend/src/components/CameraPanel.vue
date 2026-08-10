@@ -28,7 +28,7 @@ let streamingStarted = false
 let liveEdgeTimer = null
 let gopDecode = null
 
-// Zoom state (transform-origin: 0 0; transform: translate(px,py) scale(S))
+// Zoom (transform-origin: 0 0; transform: translate(px,py) scale(S))
 const zoomScale = ref(1)
 const panX = ref(0)
 const panY = ref(0)
@@ -44,7 +44,7 @@ let panStartPX = 0
 let panStartPY = 0
 let isPinching = false
 
-// Swipe state
+// Swipe
 const swipeOffset = ref(0)
 let touchStartX = 0
 let touchStartY = 0
@@ -371,7 +371,7 @@ function zoomAtPoint(newScale, vpX, vpY) {
   constrainPan()
 }
 
-// --- Touch handlers ---
+// --- Touch ---
 function onTouchStart(e) {
   swipeDecided = false
   isHorizontalSwipe = false
@@ -444,7 +444,8 @@ function onTouchMove(e) {
 
   if (isHorizontalSwipe && cameras.value.length > 1) {
     e.preventDefault()
-    swipeOffset.value = dx * 0.3
+    const max = viewportRef.value ? viewportRef.value.clientWidth * 0.25 : 80
+    swipeOffset.value = Math.max(-max, Math.min(max, dx * 0.3))
   }
 }
 
@@ -463,7 +464,6 @@ function onTouchEnd(e) {
   const dy = t.clientY - touchStartY
   const dt = Date.now() - touchStartTime
 
-  // Swipe to switch camera
   if (zoomScale.value <= 1 && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 2 && dt < 500) {
     const idx = currentCameraIndex.value
     if (dx < 0 && idx < cameras.value.length - 1) switchCamera(idx + 1)
@@ -471,7 +471,6 @@ function onTouchEnd(e) {
     return
   }
 
-  // Double-tap to zoom / reset
   const now = Date.now()
   if (now - lastTapTime < 300 && Math.abs(dx) < 10 && Math.abs(dy) < 10) {
     if (zoomScale.value > 1) {
@@ -486,14 +485,13 @@ function onTouchEnd(e) {
   lastTapTime = now
 }
 
-// --- Mouse wheel zoom ---
+// --- Mouse ---
 function onWheel(e) {
   const delta = e.deltaY > 0 ? -0.3 : 0.3
   const rect = viewportRef.value.getBoundingClientRect()
   zoomAtPoint(zoomScale.value + delta, e.clientX - rect.left, e.clientY - rect.top)
 }
 
-// --- Mouse drag for panning ---
 function onMouseDown(e) {
   if (zoomScale.value <= 1) return
   mouseDragging = true
@@ -513,7 +511,6 @@ function onMouseMove(e) {
 
 function onMouseUp() { mouseDragging = false }
 
-// --- Double-click zoom (desktop) ---
 function onDblClick(e) {
   if (zoomScale.value > 1) {
     resetZoom()
@@ -524,22 +521,22 @@ function onDblClick(e) {
 }
 
 // --- Fullscreen ---
-function enterFullscreen() {
-  const el = viewportRef.value
-  if (!el) return
-  isFullscreen.value = true
-  const fn = el.requestFullscreen || el.webkitRequestFullscreen
-  if (fn) fn.call(el)
-  try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
-}
-
-function exitFullscreen() {
-  isFullscreen.value = false
-  try {
-    if (document.fullscreenElement) document.exitFullscreen()
-    else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
-  } catch {}
-  try { screen.orientation.unlock() } catch {}
+function toggleFullscreen() {
+  if (isFullscreen.value) {
+    isFullscreen.value = false
+    try {
+      if (document.fullscreenElement) document.exitFullscreen()
+      else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
+    } catch {}
+    try { screen.orientation.unlock() } catch {}
+  } else {
+    const el = viewportRef.value
+    if (!el) return
+    isFullscreen.value = true
+    const fn = el.requestFullscreen || el.webkitRequestFullscreen
+    if (fn) fn.call(el)
+    try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
+  }
 }
 
 function doIpeyeLogout() {
@@ -555,25 +552,33 @@ function doIpeyeLogout() {
 <template>
   <div class="camera-panel">
     <!-- Loading -->
-    <div v-if="autoConnecting" class="text-center q-pa-xl">
+    <div v-if="autoConnecting" class="cam-loading">
       <q-spinner color="primary" size="2em" />
       <div class="q-mt-sm text-grey-6 text-caption">Подключение к камерам...</div>
     </div>
 
     <!-- Login -->
-    <q-card v-else-if="!ipeyeSession" dark class="section-card q-mb-sm">
+    <q-card v-else-if="!ipeyeSession" dark class="section-card">
       <q-card-section>
-        <div class="section-title">Видеонаблюдение — Авторизация</div>
+        <div class="section-title">Видеонаблюдение</div>
         <q-input v-model="ipeyeLogin" filled dense dark label="Логин IPeye" class="q-mb-sm" />
-        <q-input v-model="ipeyePassword" filled dense dark label="Пароль" type="password" class="q-mb-sm" />
-        <q-btn label="Подключить" color="primary" no-caps :loading="loginLoading" @click="doIpeyeLogin" />
+        <q-input v-model="ipeyePassword" filled dense dark label="Пароль" type="password"
+                 class="q-mb-sm" @keyup.enter="doIpeyeLogin" />
+        <q-btn label="Войти" color="primary" no-caps class="full-width"
+               :loading="loginLoading" @click="doIpeyeLogin" />
         <div v-if="loginError" class="text-negative q-mt-sm text-caption">{{ loginError }}</div>
       </q-card-section>
     </q-card>
 
     <!-- Camera viewer -->
     <template v-if="ipeyeSession">
-      <q-card dark class="section-card camera-card">
+      <div v-if="cameras.length === 0 && !autoConnecting" class="cam-empty">
+        <span class="material-icons" style="font-size:48px;color:#555;">videocam_off</span>
+        <div class="q-mt-sm text-grey-6">Нет доступных камер</div>
+        <q-btn flat dense color="grey-5" no-caps label="Выйти" class="q-mt-md" @click="doIpeyeLogout" />
+      </div>
+
+      <q-card v-else dark class="section-card camera-card">
         <q-card-section class="q-pa-none">
           <div ref="viewportRef" class="video-viewport"
                :style="{ cursor: viewportCursor }"
@@ -587,24 +592,38 @@ function doIpeyeLogout() {
                @mouseup="onMouseUp"
                @mouseleave="onMouseUp">
 
-            <div class="video-wrapper" :style="{ transform: `translateX(${swipeOffset}px)` }">
+            <div class="video-track" :style="{ transform: `translateX(${swipeOffset}px)` }">
               <video ref="videoRef" autoplay muted playsinline
-                     class="video-element" :style="zoomStyle" />
+                     class="video-el" :style="zoomStyle" />
             </div>
 
-            <!-- Top bar -->
-            <div class="camera-top-bar">
-              <span class="camera-name">{{ currentCameraName }}</span>
-              <button class="icon-btn" @click.stop="doIpeyeLogout" title="Выйти">
-                <span class="material-icons" style="font-size:18px">logout</span>
-              </button>
+            <!-- Top controls: name + buttons in one bar -->
+            <div class="ctrl-top" :class="{ 'ctrl-top--fs': isFullscreen }">
+              <div class="ctrl-name-area">
+                <span v-if="zoomScale > 1" class="zoom-pill">{{ zoomScale.toFixed(1) }}x</span>
+                <span class="ctrl-name">{{ currentCameraName }}</span>
+              </div>
+              <div class="ctrl-actions">
+                <button v-if="zoomScale > 1" class="ctrl-btn" @click.stop="resetZoom" title="Сбросить зум">
+                  <span class="material-icons">zoom_out_map</span>
+                </button>
+                <button class="ctrl-btn" @click.stop="toggleFullscreen"
+                        :title="isFullscreen ? 'Выйти из полного экрана' : 'Полный экран'">
+                  <span class="material-icons">{{ isFullscreen ? 'fullscreen_exit' : 'fullscreen' }}</span>
+                </button>
+                <button class="ctrl-btn ctrl-btn--danger" @click.stop="doIpeyeLogout" title="Выйти из аккаунта">
+                  <span class="material-icons">logout</span>
+                </button>
+              </div>
             </div>
 
-            <!-- Dot indicators -->
-            <div v-if="cameras.length > 1" class="camera-dots">
-              <span v-for="(cam, i) in cameras" :key="cam.id"
-                    class="dot" :class="{ active: cam.id === selectedCamera }"
-                    @click.stop="switchCamera(i)" />
+            <!-- Bottom controls: dot indicators -->
+            <div v-if="cameras.length > 1" class="ctrl-bottom">
+              <div class="cam-dots">
+                <span v-for="(cam, i) in cameras" :key="cam.id"
+                      class="cam-dot" :class="{ active: cam.id === selectedCamera }"
+                      @click.stop="switchCamera(i)" />
+              </div>
             </div>
 
             <!-- Status overlay -->
@@ -615,20 +634,10 @@ function doIpeyeLogout() {
 
             <!-- Error overlay -->
             <div v-if="streamError && !streamStatus" class="stream-overlay">
-              <div class="text-negative q-mb-sm">{{ streamError }}</div>
-              <q-btn flat dense color="primary" no-caps label="Повторить" @click="startStream" />
+              <span class="material-icons q-mb-sm" style="font-size:36px;color:#f44336;">error_outline</span>
+              <div class="text-negative q-mb-md" style="max-width:240px;text-align:center;">{{ streamError }}</div>
+              <q-btn outline dense color="primary" no-caps label="Повторить" icon="refresh" @click="startStream" />
             </div>
-
-            <!-- Zoom badge -->
-            <div v-if="zoomScale > 1" class="zoom-badge">{{ zoomScale.toFixed(1) }}x</div>
-
-            <!-- Fullscreen -->
-            <button v-if="!isFullscreen && !streamStatus" class="icon-btn fs-enter-btn" @click.stop="enterFullscreen">
-              <span class="material-icons">fullscreen</span>
-            </button>
-            <button v-if="isFullscreen" class="icon-btn fs-exit-btn" @click.stop="exitFullscreen">
-              <span class="material-icons">close</span>
-            </button>
           </div>
         </q-card-section>
       </q-card>
@@ -640,8 +649,14 @@ function doIpeyeLogout() {
 .section-card { background: #1a1a2e !important; border-radius: 8px; }
 .section-title { font-size: 0.85rem; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
 
+.cam-loading, .cam-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 48px 16px; text-align: center;
+}
+
 .camera-card { overflow: hidden; }
 
+/* --- Viewport --- */
 .video-viewport {
   position: relative;
   background: #000;
@@ -654,140 +669,155 @@ function doIpeyeLogout() {
   line-height: 0;
 }
 
-.video-wrapper {
+.video-track {
   width: 100%;
   transition: transform 0.15s ease-out;
 }
 
-.video-element {
+.video-el {
   display: block;
   width: 100%;
   height: auto;
 }
 
-/* Top bar */
-.camera-top-bar {
+/* --- Top controls --- */
+.ctrl-top {
   position: absolute;
   top: 0; left: 0; right: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 10px 20px;
-  background: linear-gradient(to bottom, rgba(0,0,0,0.6), transparent);
+  padding: 8px 6px 22px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.6) 0%, rgba(0,0,0,0.15) 70%, transparent 100%);
   pointer-events: none;
-  z-index: 3;
+  z-index: 4;
+}
+.ctrl-top--fs { padding: 14px 14px 28px; }
+
+.ctrl-name-area {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
 }
 
-.camera-name {
+.ctrl-name {
   color: #fff;
   font-size: 0.85rem;
   font-weight: 500;
-  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  text-shadow: 0 1px 4px rgba(0,0,0,0.9);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.icon-btn {
+.zoom-pill {
+  background: rgba(255,255,255,0.18);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 8px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.ctrl-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  pointer-events: auto;
+}
+
+.ctrl-btn {
   width: 34px; height: 34px;
   border-radius: 50%;
   border: none;
   cursor: pointer;
-  background: rgba(0,0,0,0.45);
-  color: #fff;
+  background: rgba(0,0,0,0.35);
+  color: rgba(255,255,255,0.85);
   display: flex;
   align-items: center;
   justify-content: center;
-  pointer-events: auto;
-  transition: background 0.15s;
-  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
-.icon-btn:hover { background: rgba(255,255,255,0.2); }
-.icon-btn .material-icons { font-size: 20px; }
+.ctrl-btn:active { background: rgba(255,255,255,0.15); }
+.ctrl-btn .material-icons { font-size: 20px; }
+.ctrl-btn--danger:active { background: rgba(244,67,54,0.3); color: #f44336; }
 
-/* Dot indicators */
-.camera-dots {
+.ctrl-top--fs .ctrl-btn { width: 42px; height: 42px; }
+.ctrl-top--fs .ctrl-btn .material-icons { font-size: 24px; }
+
+@media (hover: hover) {
+  .ctrl-btn:hover { background: rgba(255,255,255,0.15); }
+  .ctrl-btn--danger:hover { background: rgba(244,67,54,0.25); color: #f44336; }
+}
+
+/* --- Bottom controls --- */
+.ctrl-bottom {
   position: absolute;
-  bottom: 10px;
-  left: 50%;
-  transform: translateX(-50%);
+  bottom: 0; left: 0; right: 0;
   display: flex;
-  gap: 7px;
-  z-index: 3;
+  justify-content: center;
+  padding: 18px 8px 10px;
+  background: linear-gradient(0deg, rgba(0,0,0,0.4) 0%, transparent 100%);
+  pointer-events: none;
+  z-index: 4;
+}
+
+.cam-dots {
+  display: flex;
+  gap: 8px;
   pointer-events: auto;
 }
 
-.dot {
+.cam-dot {
   width: 8px; height: 8px;
   border-radius: 50%;
-  background: rgba(255,255,255,0.4);
+  background: rgba(255,255,255,0.35);
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.25s ease;
 }
-.dot.active {
+.cam-dot.active {
   background: #fff;
-  transform: scale(1.3);
-  box-shadow: 0 0 4px rgba(255,255,255,0.5);
+  transform: scale(1.4);
+  box-shadow: 0 0 6px rgba(255,255,255,0.4);
 }
-.dot:hover:not(.active) { background: rgba(255,255,255,0.7); }
+.cam-dot:not(.active):active { background: rgba(255,255,255,0.7); }
 
-/* Overlays */
+@media (hover: hover) {
+  .cam-dot:not(.active):hover { background: rgba(255,255,255,0.65); }
+}
+
+/* --- Overlays --- */
 .stream-overlay {
   position: absolute; inset: 0;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(0, 0, 0, 0.88);
   color: #aaa; font-size: 0.9rem;
-  z-index: 2;
+  z-index: 5;
 }
 
-/* Zoom badge */
-.zoom-badge {
-  position: absolute;
-  top: 10px; left: 50%;
-  transform: translateX(-50%);
-  background: rgba(0,0,0,0.6);
-  color: #fff;
-  font-size: 0.75rem;
-  padding: 2px 8px;
-  border-radius: 10px;
-  z-index: 3;
-  pointer-events: none;
-}
-
-/* Fullscreen buttons */
-.fs-enter-btn {
-  position: absolute;
-  top: 8px; right: 8px;
-  opacity: 0;
-  transition: opacity 0.2s;
-  z-index: 3;
-}
-.video-viewport:hover .fs-enter-btn { opacity: 1; }
-@media (pointer: coarse) { .fs-enter-btn { opacity: 0.7; } }
-
-.fs-exit-btn {
-  position: absolute;
-  top: 16px; right: 16px;
-  z-index: 10;
-  width: 44px; height: 44px;
-}
-.fs-exit-btn .material-icons { font-size: 28px; }
-
-/* Fullscreen mode */
+/* --- Fullscreen --- */
 .video-viewport:fullscreen,
 .video-viewport:-webkit-full-screen {
   background: #000;
   display: flex; align-items: center; justify-content: center;
   border-radius: 0;
 }
-.video-viewport:fullscreen .video-wrapper,
-.video-viewport:-webkit-full-screen .video-wrapper {
+.video-viewport:fullscreen .video-track,
+.video-viewport:-webkit-full-screen .video-track {
   display: flex; align-items: center; justify-content: center;
   width: 100%; height: 100%;
 }
-.video-viewport:fullscreen .video-element,
-.video-viewport:-webkit-full-screen .video-element {
+.video-viewport:fullscreen .video-el,
+.video-viewport:-webkit-full-screen .video-el {
   max-width: 100%; max-height: 100%;
   width: auto; height: auto;
 }
