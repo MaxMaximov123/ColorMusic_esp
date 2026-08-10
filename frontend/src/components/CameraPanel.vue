@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { useAuth } from '../composables/useAuth.js'
 
 const { getToken } = useAuth()
@@ -86,11 +86,13 @@ async function doIpeyeLogin() {
 
 function toggleStream() { streaming.value ? stopStream() : startStream() }
 
-function startStream() {
+async function startStream() {
   if (!selectedCamera.value || !ipeyeSession.value) return
   streamError.value = ''
   streamStatus.value = 'Подключение...'
   streaming.value = true
+
+  await nextTick()
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${location.host}/ws/camera?session=${encodeURIComponent(ipeyeSession.value)}&camera=${encodeURIComponent(selectedCamera.value)}&token=${encodeURIComponent(getToken())}`
