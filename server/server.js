@@ -8,12 +8,27 @@ const jwt = require('jsonwebtoken');
 const url = require('url');
 const knex = require('knex');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const JWT_EXPIRES = '24h';
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin';
+
+// ── RTSP Cameras ──
+
+const RTSP_CAMERAS = [];
+for (let i = 1; i <= 10; i++) {
+  const camUrl = process.env[`RTSP_CAM${i}_URL`];
+  if (camUrl) {
+    RTSP_CAMERAS.push({
+      id: `cam${i}`,
+      name: process.env[`RTSP_CAM${i}_NAME`] || `Камера ${i}`,
+      url: camUrl,
+    });
+  }
+}
 
 // ── Database (knex) ──
 
@@ -157,6 +172,172 @@ app.get('/api/temperature/:deviceId', authMiddleware, async (req, res) => {
     console.error('[temp-history]', err.message);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// ── RTSP Relay ──
+
+class RtspStream {
+  constructor(camera) {
+    this.camera = camera;
+    this.ffmpeg = null;
+    this.clients = new Set();
+    this.initSegment = null;
+    this.codec = null;
+    this.ready = false;
+    this.restartTimer = null;
+    this.restartDelay = 1000;
+  }
+
+  start() {
+    this.ready = false;
+    this.initSegment = null;
+    this.codec = null;
+
+    const args = [
+      '-hide_banner', '-nostats', '-loglevel', 'error',
+      '-fflags', 'nobuffer',
+      '-flags', 'low_delay',
+      '-rtsp_transport', 'tcp',
+      '-stimeout', '5000000',
+      '-i', this.camera.url,
+      '-c:v', 'copy', '-an',
+      '-f', 'mp4',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-flush_packets', '1',
+      'pipe:1',
+    ];
+
+    console.log(`[rtsp] ${this.camera.id} starting ffmpeg`);
+    this.ffmpeg = spawn('ffmpeg', args);
+    this.restartDelay = 1000;
+
+    let buf = Buffer.alloc(0);
+    let parseOffset = 0;
+
+    this.ffmpeg.stdout.on('data', (chunk) => {
+      if (this.ready) {
+        this.broadcast(chunk);
+        return;
+      }
+
+      buf = Buffer.concat([buf, chunk]);
+
+      while (parseOffset + 8 <= buf.length) {
+        const boxSize = buf.readUInt32BE(parseOffset);
+        if (boxSize < 8 || boxSize > 50 * 1024 * 1024) { parseOffset = buf.length; break; }
+        if (parseOffset + boxSize > buf.length) break;
+
+        const boxType = buf.toString('ascii', parseOffset + 4, parseOffset + 8);
+        if (boxType === 'moof') {
+          this.initSegment = Buffer.from(buf.slice(0, parseOffset));
+          this.codec = this._parseCodec(this.initSegment);
+          this.ready = true;
+          console.log(`[rtsp] ${this.camera.id} ready, codec: ${this.codec}, init: ${this.initSegment.length}b`);
+
+          const remaining = buf.slice(parseOffset);
+          buf = null;
+
+          for (const ws of this.clients) {
+            if (ws.readyState === 1 && !ws._rtspInitSent) this._sendInit(ws);
+          }
+          this.broadcast(remaining);
+          return;
+        }
+        parseOffset += boxSize;
+      }
+    });
+
+    this.ffmpeg.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) console.error(`[rtsp] ${this.camera.id}: ${msg}`);
+    });
+
+    this.ffmpeg.on('close', (code) => {
+      console.log(`[rtsp] ${this.camera.id} ffmpeg exited (${code}), restart in ${this.restartDelay}ms`);
+      this.ready = false;
+      this.initSegment = null;
+
+      for (const ws of this.clients) {
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ error: 'Переподключение к камере...' }));
+          ws.close();
+        }
+      }
+      this.clients.clear();
+
+      this.restartTimer = setTimeout(() => this.start(), this.restartDelay);
+      this.restartDelay = Math.min(this.restartDelay * 2, 30000);
+    });
+
+    this.ffmpeg.on('error', (err) => {
+      console.error(`[rtsp] ${this.camera.id} spawn error:`, err.message);
+    });
+  }
+
+  _parseCodec(buf) {
+    const marker = Buffer.from('avcC');
+    const idx = buf.indexOf(marker);
+    if (idx >= 0 && idx + 8 <= buf.length) {
+      const hex = n => n.toString(16).padStart(2, '0');
+      return `avc1.${hex(buf[idx + 5])}${hex(buf[idx + 6])}${hex(buf[idx + 7])}`;
+    }
+    return 'avc1.640028';
+  }
+
+  _sendInit(ws) {
+    if (!this.codec || !this.initSegment || ws._rtspInitSent) return;
+    ws._rtspInitSent = true;
+    const codecBuf = Buffer.alloc(1 + this.codec.length);
+    codecBuf[0] = 0x06;
+    codecBuf.write(this.codec, 1);
+    ws.send(codecBuf, { binary: true });
+    ws.send(this.initSegment, { binary: true });
+  }
+
+  broadcast(data) {
+    for (const ws of this.clients) {
+      if (ws.readyState === 1 && ws._rtspInitSent) {
+        ws.send(data, { binary: true });
+      }
+    }
+  }
+
+  addClient(ws) {
+    ws._rtspInitSent = false;
+    this.clients.add(ws);
+    ws.send(JSON.stringify({ status: 'connected' }));
+    if (this.ready) this._sendInit(ws);
+  }
+
+  removeClient(ws) {
+    this.clients.delete(ws);
+  }
+
+  stop() {
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    if (this.ffmpeg) {
+      this.ffmpeg.stdout.removeAllListeners();
+      this.ffmpeg.stderr.removeAllListeners();
+      this.ffmpeg.removeAllListeners();
+      this.ffmpeg.kill('SIGTERM');
+    }
+  }
+}
+
+const rtspStreams = new Map();
+
+function initRtspRelay() {
+  if (RTSP_CAMERAS.length === 0) return;
+  console.log(`[rtsp] starting relay for ${RTSP_CAMERAS.length} camera(s)`);
+  for (const cam of RTSP_CAMERAS) {
+    const stream = new RtspStream(cam);
+    rtspStreams.set(cam.id, stream);
+    stream.start();
+  }
+}
+
+app.get('/api/cameras', authMiddleware, (req, res) => {
+  res.json(RTSP_CAMERAS.map(c => ({ id: c.id, name: c.name, online: rtspStreams.get(c.id)?.ready || false })));
 });
 
 // ── IPeye Client ──
@@ -398,6 +579,7 @@ const server = http.createServer(app);
 const wssDevice = new WebSocketServer({ noServer: true });
 const wssClient = new WebSocketServer({ noServer: true });
 const wssCamera = new WebSocketServer({ noServer: true });
+const wssRtsp = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const { pathname, query } = url.parse(req.url, true);
@@ -434,6 +616,21 @@ server.on('upgrade', (req, socket, head) => {
       return;
     }
     wssCamera.handleUpgrade(req, socket, head, ws => wssCamera.emit('connection', ws, req));
+    return;
+  }
+
+  if (pathname === '/ws/rtsp') {
+    const token = query.token;
+    if (!token) { socket.destroy(); return; }
+    try {
+      jwt.verify(token, JWT_SECRET);
+    } catch {
+      wssRtsp.handleUpgrade(req, socket, head, ws => {
+        ws.close(4001, 'Token expired');
+      });
+      return;
+    }
+    wssRtsp.handleUpgrade(req, socket, head, ws => wssRtsp.emit('connection', ws, req));
     return;
   }
 
@@ -652,6 +849,32 @@ wssCamera.on('connection', (clientWs, req) => {
   });
 });
 
+// ── RTSP WS ──
+
+wssRtsp.on('connection', (ws, req) => {
+  const { camera } = url.parse(req.url, true).query;
+
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  const stream = camera && rtspStreams.get(camera);
+  if (!stream) {
+    ws.send(JSON.stringify({ error: 'Camera not found' }));
+    ws.close();
+    return;
+  }
+
+  console.log(`[rtsp-ws] client connected to ${camera} (${stream.clients.size + 1} viewers)`);
+  stream.addClient(ws);
+
+  ws.on('close', () => {
+    stream.removeClient(ws);
+    console.log(`[rtsp-ws] client left ${camera} (${stream.clients.size} viewers)`);
+  });
+
+  ws.on('error', () => stream.removeClient(ws));
+});
+
 // ── Keepalive ──
 
 const pingTimer = setInterval(() => {
@@ -670,15 +893,24 @@ const pingTimer = setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
+  for (const ws of wssRtsp.clients) {
+    if (!ws.isAlive) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    ws.ping();
+  }
 }, 30_000);
 
-server.on('close', () => clearInterval(pingTimer));
+server.on('close', () => {
+  clearInterval(pingTimer);
+  for (const stream of rtspStreams.values()) stream.stop();
+});
 
 // ── Start ──
 
 (async () => {
   await waitForDB();
   await initDB();
+  initRtspRelay();
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SmartHome server on 0.0.0.0:${PORT}`);
   });

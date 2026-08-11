@@ -16,6 +16,7 @@ const streamStatus = ref('')
 const streamError = ref('')
 const isFullscreen = ref(false)
 const autoConnecting = ref(true)
+const cameraMode = ref(null) // 'rtsp' | 'ipeye'
 
 const videoRef = ref(null)
 const viewportRef = ref(null)
@@ -27,6 +28,8 @@ let appendQueue = []
 let streamingStarted = false
 let liveEdgeTimer = null
 let gopDecode = null
+let reconnectTimer = null
+let reconnectCount = 0
 
 // Zoom (transform-origin: 0 0; transform: translate(px,py) scale(S))
 const zoomScale = ref(1)
@@ -92,12 +95,30 @@ function onFullscreenChange() {
 onMounted(async () => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
   document.addEventListener('webkitfullscreenchange', onFullscreenChange)
+
+  const headers = { 'Authorization': `Bearer ${getToken()}` }
+
+  // Try RTSP cameras first
   try {
-    const resp = await fetch('/api/ipeye/connect', {
-      headers: { 'Authorization': `Bearer ${getToken()}` }
-    })
+    const resp = await fetch('/api/cameras', { headers })
+    const cams = await resp.json()
+    if (cams.length > 0) {
+      cameraMode.value = 'rtsp'
+      cameras.value = cams
+      selectedCamera.value = cams[0].id
+      autoConnecting.value = false
+      await nextTick()
+      startStream()
+      return
+    }
+  } catch {}
+
+  // Fallback to IPeye
+  try {
+    const resp = await fetch('/api/ipeye/connect', { headers })
     const data = await resp.json()
     if (data.session) {
+      cameraMode.value = 'ipeye'
       ipeyeSession.value = data.session
       cameras.value = data.cameras || []
       if (cameras.value.length > 0) {
@@ -111,6 +132,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   stopStream()
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
@@ -127,6 +149,7 @@ async function doIpeyeLogin() {
     })
     const data = await resp.json()
     if (!resp.ok) { loginError.value = data.error || 'Ошибка авторизации'; return }
+    cameraMode.value = 'ipeye'
     ipeyeSession.value = data.session
     cameras.value = data.cameras || []
     if (cameras.value.length > 0) {
@@ -145,13 +168,21 @@ async function doIpeyeLogin() {
 
 // --- Stream ---
 function startStream() {
-  if (!selectedCamera.value || !ipeyeSession.value) return
+  if (!selectedCamera.value) return
+  if (cameraMode.value === 'ipeye' && !ipeyeSession.value) return
   streamError.value = ''
   streamStatus.value = 'Подключение...'
   streaming.value = true
+  reconnectCount = 0
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const wsUrl = `${protocol}//${location.host}/ws/camera?session=${encodeURIComponent(ipeyeSession.value)}&camera=${encodeURIComponent(selectedCamera.value)}&token=${encodeURIComponent(getToken())}`
+  const token = encodeURIComponent(getToken())
+  let wsUrl
+  if (cameraMode.value === 'rtsp') {
+    wsUrl = `${protocol}//${location.host}/ws/rtsp?camera=${encodeURIComponent(selectedCamera.value)}&token=${token}`
+  } else {
+    wsUrl = `${protocol}//${location.host}/ws/camera?session=${encodeURIComponent(ipeyeSession.value)}&camera=${encodeURIComponent(selectedCamera.value)}&token=${token}`
+  }
   connectToStream(wsUrl)
 }
 
@@ -223,6 +254,7 @@ function connectToStream(wsUrl) {
     streaming.value = false
     streamStatus.value = ''
     cleanupMse()
+    scheduleReconnect()
   }
 
   ws.onerror = () => {
@@ -326,10 +358,23 @@ function cleanupMse() {
 }
 
 function stopStream() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   if (ws) { ws.close(); ws = null }
   streaming.value = false
   streamStatus.value = ''
   cleanupMse()
+}
+
+function scheduleReconnect() {
+  if (cameraMode.value !== 'rtsp' || !selectedCamera.value) return
+  if (reconnectCount >= 10) return
+  reconnectCount++
+  const delay = Math.min(1000 * Math.pow(1.5, reconnectCount - 1), 10000)
+  streamStatus.value = 'Переподключение...'
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null
+    if (selectedCamera.value) startStream()
+  }, delay)
 }
 
 // --- Camera switching ---
@@ -557,8 +602,8 @@ function doIpeyeLogout() {
       <div class="q-mt-sm text-grey-6 text-caption">Подключение к камерам...</div>
     </div>
 
-    <!-- Login -->
-    <q-card v-else-if="!ipeyeSession" dark class="section-card">
+    <!-- Login (IPeye mode only) -->
+    <q-card v-else-if="!ipeyeSession && cameraMode !== 'rtsp'" dark class="section-card">
       <q-card-section>
         <div class="section-title">Видеонаблюдение</div>
         <q-input v-model="ipeyeLogin" filled dense dark label="Логин IPeye" class="q-mb-sm" />
@@ -571,7 +616,7 @@ function doIpeyeLogout() {
     </q-card>
 
     <!-- Camera viewer -->
-    <template v-if="ipeyeSession">
+    <template v-if="ipeyeSession || cameraMode === 'rtsp'">
       <div v-if="cameras.length === 0 && !autoConnecting" class="cam-empty">
         <span class="material-icons" style="font-size:48px;color:#555;">videocam_off</span>
         <div class="q-mt-sm text-grey-6">Нет доступных камер</div>
@@ -611,7 +656,7 @@ function doIpeyeLogout() {
                         :title="isFullscreen ? 'Выйти из полного экрана' : 'Полный экран'">
                   <span class="material-icons">{{ isFullscreen ? 'fullscreen_exit' : 'fullscreen' }}</span>
                 </button>
-                <button class="ctrl-btn ctrl-btn--danger" @click.stop="doIpeyeLogout" title="Выйти из аккаунта">
+                <button v-if="cameraMode === 'ipeye'" class="ctrl-btn ctrl-btn--danger" @click.stop="doIpeyeLogout" title="Выйти из аккаунта">
                   <span class="material-icons">logout</span>
                 </button>
               </div>
