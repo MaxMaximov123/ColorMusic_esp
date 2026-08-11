@@ -170,10 +170,13 @@ async function doIpeyeLogin() {
 function startStream() {
   if (!selectedCamera.value) return
   if (cameraMode.value === 'ipeye' && !ipeyeSession.value) return
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null }
+  cleanupMse()
+
   streamError.value = ''
   streamStatus.value = 'Подключение...'
   streaming.value = true
-  reconnectCount = 0
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const token = encodeURIComponent(getToken())
@@ -232,7 +235,10 @@ function connectToStream(wsUrl) {
       try {
         const msg = JSON.parse(event.data)
         if (msg.error) { streamError.value = msg.error; stopStream(); return }
-        if (msg.status === 'connected') streamStatus.value = 'Ожидание видеоданных...'
+        if (msg.status === 'connected') {
+          streamStatus.value = 'Ожидание видеоданных...'
+          reconnectCount = 0
+        }
       } catch {}
       return
     }
@@ -251,17 +257,15 @@ function connectToStream(wsUrl) {
   }
 
   ws.onclose = () => {
+    ws = null
     streaming.value = false
     streamStatus.value = ''
     cleanupMse()
-    scheduleReconnect()
+    if (!streamError.value) scheduleReconnect()
   }
 
   ws.onerror = () => {
     streamError.value = 'Ошибка соединения с камерой'
-    streaming.value = false
-    streamStatus.value = ''
-    cleanupMse()
   }
 }
 
@@ -359,7 +363,8 @@ function cleanupMse() {
 
 function stopStream() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
-  if (ws) { ws.close(); ws = null }
+  reconnectCount = 0
+  if (ws) { ws.onclose = null; ws.onerror = null; ws.close(); ws = null }
   streaming.value = false
   streamStatus.value = ''
   cleanupMse()

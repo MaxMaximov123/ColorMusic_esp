@@ -186,9 +186,12 @@ class RtspStream {
     this.ready = false;
     this.restartTimer = null;
     this.restartDelay = 1000;
+    this.restartCount = 0;
+    this.stopped = false;
   }
 
   start() {
+    if (this.stopped) return;
     this.ready = false;
     this.initSegment = null;
     this.codec = null;
@@ -199,6 +202,7 @@ class RtspStream {
       '-flags', 'low_delay',
       '-rtsp_transport', 'tcp',
       '-stimeout', '5000000',
+      '-timeout', '5000000',
       '-i', this.camera.url,
       '-c:v', 'copy', '-an',
       '-f', 'mp4',
@@ -207,9 +211,8 @@ class RtspStream {
       'pipe:1',
     ];
 
-    console.log(`[rtsp] ${this.camera.id} starting ffmpeg`);
-    this.ffmpeg = spawn('ffmpeg', args);
-    this.restartDelay = 1000;
+    console.log(`[rtsp] ${this.camera.id} starting ffmpeg (attempt ${this.restartCount + 1})`);
+    this.ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let buf = Buffer.alloc(0);
     let parseOffset = 0;
@@ -232,6 +235,8 @@ class RtspStream {
           this.initSegment = Buffer.from(buf.slice(0, parseOffset));
           this.codec = this._parseCodec(this.initSegment);
           this.ready = true;
+          this.restartDelay = 1000;
+          this.restartCount = 0;
           console.log(`[rtsp] ${this.camera.id} ready, codec: ${this.codec}, init: ${this.initSegment.length}b`);
 
           const remaining = buf.slice(parseOffset);
@@ -253,18 +258,37 @@ class RtspStream {
     });
 
     this.ffmpeg.on('close', (code) => {
-      console.log(`[rtsp] ${this.camera.id} ffmpeg exited (${code}), restart in ${this.restartDelay}ms`);
+      this.ffmpeg = null;
+      const wasReady = this.ready;
       this.ready = false;
       this.initSegment = null;
+      this.restartCount++;
 
-      for (const ws of this.clients) {
-        if (ws.readyState === 1) {
-          ws.send(JSON.stringify({ error: 'Переподключение к камере...' }));
-          ws.close();
+      if (wasReady) {
+        console.log(`[rtsp] ${this.camera.id} ffmpeg died while streaming (code ${code}), reconnecting...`);
+        for (const ws of this.clients) {
+          if (ws.readyState === 1) {
+            ws._rtspInitSent = false;
+          }
         }
+        this.restartDelay = 1000;
+      } else {
+        console.log(`[rtsp] ${this.camera.id} ffmpeg failed to connect (code ${code}), attempt ${this.restartCount}`);
       }
-      this.clients.clear();
 
+      if (this.restartCount >= 30) {
+        console.error(`[rtsp] ${this.camera.id} giving up after ${this.restartCount} failures`);
+        for (const ws of this.clients) {
+          if (ws.readyState === 1) {
+            ws.send(JSON.stringify({ error: 'Камера недоступна' }));
+            ws.close();
+          }
+        }
+        this.clients.clear();
+        return;
+      }
+
+      console.log(`[rtsp] ${this.camera.id} restart in ${this.restartDelay}ms`);
       this.restartTimer = setTimeout(() => this.start(), this.restartDelay);
       this.restartDelay = Math.min(this.restartDelay * 2, 30000);
     });
@@ -307,6 +331,13 @@ class RtspStream {
     this.clients.add(ws);
     ws.send(JSON.stringify({ status: 'connected' }));
     if (this.ready) this._sendInit(ws);
+
+    // If camera gave up, try again on new client
+    if (!this.ffmpeg && !this.restartTimer && this.restartCount >= 30) {
+      this.restartCount = 0;
+      this.restartDelay = 1000;
+      this.start();
+    }
   }
 
   removeClient(ws) {
@@ -314,12 +345,14 @@ class RtspStream {
   }
 
   stop() {
-    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.stopped = true;
+    if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
     if (this.ffmpeg) {
       this.ffmpeg.stdout.removeAllListeners();
       this.ffmpeg.stderr.removeAllListeners();
       this.ffmpeg.removeAllListeners();
       this.ffmpeg.kill('SIGTERM');
+      this.ffmpeg = null;
     }
   }
 }
