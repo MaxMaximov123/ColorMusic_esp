@@ -311,23 +311,22 @@ function loadPacket() {
 function onUpdateEnd() {
   if (!sourceBuffer) return
   if (sourceBuffer.buffered.length > 0) {
-    const range = sourceBuffer.buffered.length - 1
-    const bufferedEnd = sourceBuffer.buffered.end(range)
+    const bufferedEnd = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
 
     if (streamStatus.value) {
       streamStatus.value = ''
       startLiveEdgeSeeker()
     }
 
-    if (gopDecode === null && videoRef.value) {
-      gopDecode = Math.abs(bufferedEnd - videoRef.value.currentTime)
-    }
-
     const video = videoRef.value
     if (video) {
-      const avgBuf = gopDecode !== null ? Math.max(gopDecode, 0.9) : 2
-      if (bufferedEnd - video.currentTime >= avgBuf * 3) {
-        video.currentTime = bufferedEnd - avgBuf * 1.5
+      if (!gopDecode) {
+        video.currentTime = bufferedEnd - 0.1
+        gopDecode = true
+        if (video.paused) video.play().catch(() => {})
+      }
+      if (bufferedEnd - video.currentTime > 3) {
+        video.currentTime = bufferedEnd - 0.5
       }
     }
 
@@ -345,8 +344,7 @@ function startLiveEdgeSeeker() {
     const video = videoRef.value
     if (!video || !sourceBuffer || !sourceBuffer.buffered.length) return
     const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1)
-    const avgBuf = gopDecode !== null ? Math.max(gopDecode, 0.9) : 2
-    if (end - video.currentTime > avgBuf * 3) video.currentTime = end - avgBuf * 1.5
+    if (end - video.currentTime > 3) video.currentTime = end - 0.5
   }, 3000)
 }
 
