@@ -239,7 +239,15 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.section-card { background: #1a1a2e !important; border-radius: 8px; }
+.section-card {
+  background: rgba(255, 255, 255, 0.04) !important;
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12),
+              inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
 .section-title {
   font-size: 0.85rem; font-weight: 600; color: #aaa;
   text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px;

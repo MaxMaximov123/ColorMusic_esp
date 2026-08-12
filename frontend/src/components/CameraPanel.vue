@@ -716,12 +716,32 @@ function doIpeyeLogout() {
           </div>
         </q-card-section>
       </q-card>
+
+      <!-- Camera grid selector -->
+      <div v-if="cameras.length > 1" class="cam-grid">
+        <button v-for="(cam, i) in cameras" :key="'thumb-' + cam.id"
+                class="cam-thumb" :class="{ 'cam-thumb--active': cam.id === selectedCamera }"
+                @click="switchCamera(i)">
+          <div class="cam-thumb-preview">
+            <span class="material-icons cam-thumb-icon">videocam</span>
+          </div>
+          <span class="cam-thumb-name">{{ cam.name || cam.id }}</span>
+        </button>
+      </div>
     </template>
   </div>
 </template>
 
 <style scoped>
-.section-card { background: #1a1a2e !important; border-radius: 8px; }
+.section-card {
+  background: rgba(255, 255, 255, 0.04) !important;
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12),
+              inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
 .section-title { font-size: 0.85rem; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }
 
 .cam-loading, .cam-empty {
@@ -735,7 +755,7 @@ function doIpeyeLogout() {
 .video-viewport {
   position: relative;
   background: #000;
-  border-radius: 8px;
+  border-radius: 16px;
   overflow: hidden;
   touch-action: none;
   user-select: none;
@@ -931,5 +951,64 @@ function doIpeyeLogout() {
   .ctrl-btn .material-icons { font-size: 18px; }
   .ctrl-name { font-size: 0.78rem; }
   .ctrl-top { padding: 6px 4px 18px; }
+}
+
+/* --- Camera grid --- */
+.cam-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cam-thumb {
+  background: rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 14px;
+  overflow: hidden;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  transition: border-color 0.25s, box-shadow 0.25s;
+}
+
+.cam-thumb--active {
+  border-color: rgba(46, 232, 183, 0.4);
+  box-shadow: 0 0 16px rgba(46, 232, 183, 0.1);
+}
+
+.cam-thumb-preview {
+  aspect-ratio: 16/9;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cam-thumb-icon {
+  font-size: 28px;
+  color: rgba(255, 255, 255, 0.12);
+}
+
+.cam-thumb-name {
+  display: block;
+  padding: 8px 10px;
+  font-size: 0.8rem;
+  color: #aaa;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (hover: hover) {
+  .cam-thumb:hover { border-color: rgba(255, 255, 255, 0.15); }
+  .cam-thumb--active:hover { border-color: rgba(46, 232, 183, 0.5); }
+}
+
+@media (min-width: 768px) {
+  .cam-grid { grid-template-columns: repeat(3, 1fr); gap: 12px; }
 }
 </style>
