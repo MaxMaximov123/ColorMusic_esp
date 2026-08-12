@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="80" fill="#0a0e1a"/>
+  <!-- House outline -->
+  <path d="M256 100 L420 230 L420 410 Q420 420 410 420 L300 420 L300 310 L212 310 L212 420 L102 420 Q92 420 92 410 L92 230 Z"
+        fill="none" stroke="#2ee8b7" stroke-width="28" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- Chimney -->
+  <rect x="340" y="140" width="36" height="70" rx="4" fill="none" stroke="#2ee8b7" stroke-width="22" stroke-linejoin="round"/>
+  <!-- Thermometer -->
+  <g transform="translate(256, 280)">
+    <path d="M0 -80 L0 20" fill="none" stroke="#2ee8b7" stroke-width="16" stroke-linecap="round"/>
+    <circle cx="0" cy="38" r="22" fill="#2ee8b7"/>
+    <circle cx="0" cy="38" r="12" fill="#0a0e1a"/>
+    <circle cx="0" cy="38" r="8" fill="#2ee8b7"/>
+  </g>
+</svg>

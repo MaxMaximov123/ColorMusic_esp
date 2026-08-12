@@ -592,32 +592,58 @@ function onDblClick(e) {
 }
 
 // --- Fullscreen ---
+function exitFs() {
+  isFullscreen.value = false
+  fsFallback.value = false
+  document.body.style.overflow = ''
+  document.documentElement.classList.remove('cam-fs-active')
+  try {
+    if (document.fullscreenElement) document.exitFullscreen()
+    else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
+  } catch {}
+  try { screen.orientation.unlock() } catch {}
+}
+
+function enterFsFallback() {
+  fsFallback.value = true
+  document.body.style.overflow = 'hidden'
+  document.documentElement.classList.add('cam-fs-active')
+}
+
 function toggleFullscreen() {
   if (isFullscreen.value) {
-    isFullscreen.value = false
-    fsFallback.value = false
-    document.body.style.overflow = ''
-    try {
-      if (document.fullscreenElement) document.exitFullscreen()
-      else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
-    } catch {}
-    try { screen.orientation.unlock() } catch {}
-  } else {
-    const el = viewportRef.value
-    if (!el) return
-    isFullscreen.value = true
-    const fn = el.requestFullscreen || el.webkitRequestFullscreen
-    if (fn) {
-      try {
-        const p = fn.call(el)
-        if (p && p.catch) p.catch(() => { fsFallback.value = true; document.body.style.overflow = 'hidden' })
-      } catch { fsFallback.value = true; document.body.style.overflow = 'hidden' }
-    } else {
-      fsFallback.value = true
-      document.body.style.overflow = 'hidden'
-    }
-    try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
+    exitFs()
+    return
   }
+
+  const el = viewportRef.value
+  if (!el) return
+  isFullscreen.value = true
+
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen
+  if (fn) {
+    try {
+      const p = fn.call(el)
+      if (p && p.catch) p.catch(() => {
+        const video = videoRef.value
+        if (video && video.webkitEnterFullscreen) {
+          try { video.webkitEnterFullscreen() } catch { enterFsFallback() }
+        } else {
+          enterFsFallback()
+        }
+      })
+    } catch {
+      enterFsFallback()
+    }
+  } else {
+    const video = videoRef.value
+    if (video && video.webkitEnterFullscreen) {
+      try { video.webkitEnterFullscreen() } catch { enterFsFallback() }
+    } else {
+      enterFsFallback()
+    }
+  }
+  try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
 }
 
 function doIpeyeLogout() {
@@ -661,9 +687,7 @@ function doIpeyeLogout() {
 
       <q-card v-else dark class="section-card camera-card">
         <q-card-section class="q-pa-none">
-          <div ref="viewportRef" class="video-viewport"
-               :class="{ 'vp-fs-fallback': fsFallback }"
-               :style="{ cursor: viewportCursor }"
+          <div ref="viewportRef" class="video-viewport" :style="{ cursor: viewportCursor }"
                @touchstart="onTouchStart"
                @touchmove="onTouchMove"
                @touchend="onTouchEnd"
@@ -736,6 +760,7 @@ function doIpeyeLogout() {
         </button>
       </div>
     </template>
+
   </div>
 </template>
 
@@ -933,27 +958,7 @@ function doIpeyeLogout() {
   object-fit: contain;
 }
 
-/* --- Fullscreen CSS fallback (iOS Safari / browsers without Fullscreen API on div) --- */
-.vp-fs-fallback {
-  position: fixed !important;
-  inset: 0;
-  z-index: 99999;
-  border-radius: 0 !important;
-  min-height: 100dvh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
-           env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
-}
-.vp-fs-fallback .video-track {
-  width: 100%; height: 100%;
-  display: flex; align-items: center; justify-content: center;
-}
-.vp-fs-fallback .video-el {
-  width: 100%; height: 100%;
-  object-fit: contain;
-}
+/* --- Fullscreen CSS fallback — uses class on <html> to escape containment --- */
 
 /* --- Responsive controls --- */
 @media (min-width: 768px) {
@@ -1026,5 +1031,56 @@ function doIpeyeLogout() {
 
 @media (min-width: 768px) {
   .cam-grid { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+}
+</style>
+
+<!-- Unscoped: fullscreen fallback targets elements outside component scope -->
+<style>
+html.cam-fs-active .camera-panel .section-card {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  overflow: visible !important;
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+html.cam-fs-active .camera-panel .q-card__section {
+  overflow: visible !important;
+}
+html.cam-fs-active .camera-panel .video-viewport {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 99999 !important;
+  border-radius: 0 !important;
+  min-height: 100dvh;
+  width: 100vw !important;
+  height: 100dvh !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+html.cam-fs-active .camera-panel .video-track {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+html.cam-fs-active .camera-panel .video-el {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: contain;
+  transform: none !important;
+}
+html.cam-fs-active .camera-panel .cam-grid,
+html.cam-fs-active .camera-panel .cam-empty,
+html.cam-fs-active .camera-panel .cam-loading {
+  display: none !important;
+}
+html.cam-fs-active .bnav,
+html.cam-fs-active .sidebar,
+html.cam-fs-active .hdr-m,
+html.cam-fs-active .hdr-d {
+  display: none !important;
 }
 </style>
