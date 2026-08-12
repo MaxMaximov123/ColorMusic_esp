@@ -188,6 +188,9 @@ class RtspStream {
     this.restartDelay = 1000;
     this.restartCount = 0;
     this.stopped = false;
+    this.fragBuf = Buffer.alloc(0);
+    this.pendingMoof = null;
+    this.latestFragment = null;
   }
 
   start() {
@@ -195,6 +198,9 @@ class RtspStream {
     this.ready = false;
     this.initSegment = null;
     this.codec = null;
+    this.fragBuf = Buffer.alloc(0);
+    this.pendingMoof = null;
+    this.latestFragment = null;
 
     const args = [
       '-hide_banner', '-nostats', '-loglevel', 'warning',
@@ -215,7 +221,7 @@ class RtspStream {
 
     this.ffmpeg.stdout.on('data', (chunk) => {
       if (this.ready) {
-        this.broadcast(chunk);
+        this._accumulateAndBroadcast(chunk);
         return;
       }
 
@@ -235,13 +241,13 @@ class RtspStream {
           this.restartCount = 0;
           console.log(`[rtsp] ${this.camera.id} ready, codec: ${this.codec}, init: ${this.initSegment.length}b`);
 
-          const remaining = buf.slice(parseOffset);
+          const remaining = Buffer.from(buf.slice(parseOffset));
           buf = null;
 
           for (const ws of this.clients) {
             if (ws.readyState === 1 && !ws._rtspInitSent) this._sendInit(ws);
           }
-          this.broadcast(remaining);
+          this._accumulateAndBroadcast(remaining);
           return;
         }
         parseOffset += boxSize;
@@ -258,6 +264,9 @@ class RtspStream {
       const wasReady = this.ready;
       this.ready = false;
       this.initSegment = null;
+      this.fragBuf = Buffer.alloc(0);
+      this.pendingMoof = null;
+      this.latestFragment = null;
       this.restartCount++;
 
       if (wasReady) {
@@ -304,6 +313,33 @@ class RtspStream {
     return 'avc1.640028';
   }
 
+  _accumulateAndBroadcast(chunk) {
+    this.fragBuf = Buffer.concat([this.fragBuf, chunk]);
+
+    while (this.fragBuf.length >= 8) {
+      const boxSize = this.fragBuf.readUInt32BE(0);
+      if (boxSize < 8 || boxSize > 50 * 1024 * 1024) {
+        this.fragBuf = Buffer.alloc(0);
+        this.pendingMoof = null;
+        break;
+      }
+      if (this.fragBuf.length < boxSize) break;
+
+      const boxType = this.fragBuf.toString('ascii', 4, 8);
+      const box = Buffer.from(this.fragBuf.slice(0, boxSize));
+      this.fragBuf = this.fragBuf.slice(boxSize);
+
+      if (boxType === 'moof') {
+        this.pendingMoof = box;
+      } else if (boxType === 'mdat' && this.pendingMoof) {
+        const fragment = Buffer.concat([this.pendingMoof, box]);
+        this.pendingMoof = null;
+        this.latestFragment = fragment;
+        this.broadcast(fragment);
+      }
+    }
+  }
+
   _sendInit(ws) {
     if (!this.codec || !this.initSegment || ws._rtspInitSent) return;
     ws._rtspInitSent = true;
@@ -312,6 +348,9 @@ class RtspStream {
     codecBuf.write(this.codec, 1);
     ws.send(codecBuf, { binary: true });
     ws.send(this.initSegment, { binary: true });
+    if (this.latestFragment) {
+      ws.send(this.latestFragment, { binary: true });
+    }
   }
 
   broadcast(data) {
