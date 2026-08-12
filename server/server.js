@@ -326,10 +326,14 @@ class RtspStream {
     ws._rtspInitSent = false;
     this.clients.add(ws);
     ws.send(JSON.stringify({ status: 'connected' }));
-    if (this.ready) this._sendInit(ws);
+    if (this.ready) {
+      this._sendInit(ws);
+      console.log(`[rtsp] ${this.camera.id} sent init (${this.initSegment.length}b, codec: ${this.codec}) to new client`);
+    } else {
+      console.log(`[rtsp] ${this.camera.id} client connected, waiting for stream...`);
+    }
 
-    // If camera gave up, try again on new client
-    if (!this.ffmpeg && !this.restartTimer && this.restartCount >= 30) {
+    if (!this.ffmpeg && !this.restartTimer && this.restartCount >= 100) {
       this.restartCount = 0;
       this.restartDelay = 1000;
       this.start();
@@ -366,7 +370,10 @@ function initRtspRelay() {
 }
 
 app.get('/api/cameras', authMiddleware, (req, res) => {
-  res.json(RTSP_CAMERAS.map(c => ({ id: c.id, name: c.name, online: rtspStreams.get(c.id)?.ready || false })));
+  res.json(RTSP_CAMERAS.map(c => {
+    const s = rtspStreams.get(c.id);
+    return { id: c.id, name: c.name, online: !!s?.ffmpeg, ready: !!s?.ready };
+  }));
 });
 
 // ── IPeye Client ──

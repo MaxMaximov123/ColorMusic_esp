@@ -204,6 +204,7 @@ function connectToStream(wsUrl) {
 
   let sourceOpen = false
   let pendingCodec = null
+  let pendingPackets = []
 
   mediaSource.addEventListener('sourceopen', () => {
     sourceOpen = true
@@ -225,6 +226,11 @@ function connectToStream(wsUrl) {
     sourceBuffer.addEventListener('error', () => {
       streamError.value = 'Ошибка декодирования видео'
     })
+    if (pendingPackets.length > 0) {
+      for (const pkt of pendingPackets) pushPacket(pkt)
+      pendingPackets = []
+      if (video.paused) video.play().catch(() => {})
+    }
   }
 
   ws = new WebSocket(wsUrl)
@@ -251,7 +257,10 @@ function connectToStream(wsUrl) {
       return
     }
 
-    if (!sourceBuffer) return
+    if (!sourceBuffer) {
+      pendingPackets.push(event.data)
+      return
+    }
     pushPacket(event.data)
     if (video.paused) video.play().catch(() => {})
   }
