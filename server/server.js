@@ -41,7 +41,7 @@ const db = knex({
     user: process.env.DB_USER || 'smarthome',
     password: process.env.DB_PASS || 'smarthome',
   },
-  pool: { min: 1, max: 10 },
+  pool: { min: 1, max: 5 },
 });
 
 async function waitForDB(retries = 20, delay = 2000) {
@@ -112,6 +112,22 @@ async function initDB() {
     await db('users').insert({ username: ADMIN_USER, password_hash: hash });
     console.log(`[db] admin user "${ADMIN_USER}" created`);
   }
+
+  const deleted = await db('temperature_history')
+    .where('recorded_at', '<', db.raw("NOW() - INTERVAL '2 days'"))
+    .del();
+  if (deleted > 0) console.log(`[db] startup cleanup: removed ${deleted} old temperature records (>2 days)`);
+}
+
+async function cleanupOldData() {
+  try {
+    const deleted = await db('temperature_history')
+      .where('recorded_at', '<', db.raw("NOW() - INTERVAL '7 days'"))
+      .del();
+    if (deleted > 0) console.log(`[db] periodic cleanup: removed ${deleted} old temperature records (>7 days)`);
+  } catch (err) {
+    console.error('[db] cleanup error:', err.message);
+  }
 }
 
 // ── Express ──
@@ -166,6 +182,7 @@ app.get('/api/temperature/:deviceId', authMiddleware, async (req, res) => {
       .where('device_id', req.params.deviceId)
       .where('recorded_at', '>', db.raw("NOW() - INTERVAL '1 hour' * ?", [hours]))
       .orderBy('recorded_at', 'asc')
+      .limit(2000)
       .select('temperature', 'recorded_at');
     res.json(rows);
   } catch (err) {
@@ -186,11 +203,11 @@ class RtspStream {
     this.ready = false;
     this.restartTimer = null;
     this.restartDelay = 1000;
-    this.restartCount = 0;
     this.stopped = false;
     this.fragBuf = Buffer.alloc(0);
     this.pendingMoof = null;
     this.latestFragment = null;
+    this.stallTimer = null;
   }
 
   start() {
@@ -201,6 +218,7 @@ class RtspStream {
     this.fragBuf = Buffer.alloc(0);
     this.pendingMoof = null;
     this.latestFragment = null;
+    this._clearStallTimer();
 
     const args = [
       '-hide_banner', '-nostats', '-loglevel', 'warning',
@@ -213,13 +231,17 @@ class RtspStream {
       'pipe:1',
     ];
 
-    console.log(`[rtsp] ${this.camera.id} starting ffmpeg (attempt ${this.restartCount + 1})`);
+    console.log(`[rtsp] ${this.camera.id}: starting ffmpeg`);
     this.ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    this._resetStallTimer(180000);
 
     let buf = Buffer.alloc(0);
     let parseOffset = 0;
 
     this.ffmpeg.stdout.on('data', (chunk) => {
+      this._resetStallTimer(this.ready ? 30000 : 180000);
+
       if (this.ready) {
         this._accumulateAndBroadcast(chunk);
         return;
@@ -238,14 +260,13 @@ class RtspStream {
           this.codec = this._parseCodec(this.initSegment);
           this.ready = true;
           this.restartDelay = 1000;
-          this.restartCount = 0;
-          console.log(`[rtsp] ${this.camera.id} ready, codec: ${this.codec}, init: ${this.initSegment.length}b`);
+          console.log(`[rtsp] ${this.camera.id}: ready, codec=${this.codec}, init=${this.initSegment.length}b`);
 
           const remaining = Buffer.from(buf.slice(parseOffset));
           buf = null;
 
           for (const ws of this.clients) {
-            if (ws.readyState === 1 && !ws._rtspInitSent) this._sendInit(ws);
+            if (ws.readyState === 1) this._sendInit(ws);
           }
           this._accumulateAndBroadcast(remaining);
           return;
@@ -267,40 +288,41 @@ class RtspStream {
       this.fragBuf = Buffer.alloc(0);
       this.pendingMoof = null;
       this.latestFragment = null;
-      this.restartCount++;
+      this._clearStallTimer();
 
-      if (wasReady) {
-        console.log(`[rtsp] ${this.camera.id} ffmpeg died while streaming (code ${code}), reconnecting...`);
-        for (const ws of this.clients) {
-          if (ws.readyState === 1) {
-            ws._rtspInitSent = false;
-          }
+      console.log(`[rtsp] ${this.camera.id}: ffmpeg exited (code ${code}), was${wasReady ? '' : ' not'} streaming`);
+
+      for (const ws of this.clients) {
+        if (ws.readyState === 1) {
+          ws._rtspInitSent = false;
+          ws.send(JSON.stringify({ status: 'reconnecting' }));
         }
-        this.restartDelay = 1000;
-      } else {
-        console.log(`[rtsp] ${this.camera.id} ffmpeg failed to connect (code ${code}), attempt ${this.restartCount}`);
       }
 
-      if (this.restartCount >= 100) {
-        console.error(`[rtsp] ${this.camera.id} giving up after ${this.restartCount} failures`);
-        for (const ws of this.clients) {
-          if (ws.readyState === 1) {
-            ws.send(JSON.stringify({ error: 'Камера недоступна' }));
-            ws.close();
-          }
-        }
-        this.clients.clear();
-        return;
-      }
+      if (wasReady) this.restartDelay = 1000;
 
-      console.log(`[rtsp] ${this.camera.id} restart in ${this.restartDelay}ms`);
-      this.restartTimer = setTimeout(() => this.start(), this.restartDelay);
-      this.restartDelay = Math.min(this.restartDelay * 2, 30000);
+      if (!this.stopped) {
+        console.log(`[rtsp] ${this.camera.id}: restarting in ${this.restartDelay}ms`);
+        this.restartTimer = setTimeout(() => this.start(), this.restartDelay);
+        this.restartDelay = Math.min(this.restartDelay * 1.5, 15000);
+      }
     });
 
     this.ffmpeg.on('error', (err) => {
-      console.error(`[rtsp] ${this.camera.id} spawn error:`, err.message);
+      console.error(`[rtsp] ${this.camera.id}: spawn error: ${err.message}`);
     });
+  }
+
+  _resetStallTimer(ms) {
+    this._clearStallTimer();
+    this.stallTimer = setTimeout(() => {
+      console.warn(`[rtsp] ${this.camera.id}: no data for ${ms / 1000}s, killing ffmpeg`);
+      if (this.ffmpeg) this.ffmpeg.kill('SIGTERM');
+    }, ms);
+  }
+
+  _clearStallTimer() {
+    if (this.stallTimer) { clearTimeout(this.stallTimer); this.stallTimer = null; }
   }
 
   _parseCodec(buf) {
@@ -364,18 +386,13 @@ class RtspStream {
   addClient(ws) {
     ws._rtspInitSent = false;
     this.clients.add(ws);
-    ws.send(JSON.stringify({ status: 'connected' }));
     if (this.ready) {
+      ws.send(JSON.stringify({ status: 'connected' }));
       this._sendInit(ws);
-      console.log(`[rtsp] ${this.camera.id} sent init (${this.initSegment.length}b, codec: ${this.codec}) to new client`);
+      console.log(`[rtsp] ${this.camera.id}: client joined, sent init (${this.initSegment.length}b, codec: ${this.codec})`);
     } else {
-      console.log(`[rtsp] ${this.camera.id} client connected, waiting for stream...`);
-    }
-
-    if (!this.ffmpeg && !this.restartTimer && this.restartCount >= 100) {
-      this.restartCount = 0;
-      this.restartDelay = 1000;
-      this.start();
+      ws.send(JSON.stringify({ status: 'connecting' }));
+      console.log(`[rtsp] ${this.camera.id}: client joined, stream not ready yet`);
     }
   }
 
@@ -385,6 +402,7 @@ class RtspStream {
 
   stop() {
     this.stopped = true;
+    this._clearStallTimer();
     if (this.restartTimer) { clearTimeout(this.restartTimer); this.restartTimer = null; }
     if (this.ffmpeg) {
       this.ffmpeg.stdout.removeAllListeners();
@@ -986,6 +1004,7 @@ server.on('close', () => {
   await waitForDB();
   await initDB();
   initRtspRelay();
+  setInterval(cleanupOldData, 6 * 3600_000);
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`SmartHome server on 0.0.0.0:${PORT}`);
   });

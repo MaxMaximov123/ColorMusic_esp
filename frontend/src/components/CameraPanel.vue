@@ -199,38 +199,36 @@ function connectToStream(wsUrl) {
   if (!video) return
 
   const MSrc = window.ManagedMediaSource || window.MediaSource
-  mediaSource = new MSrc()
-  video.src = URL.createObjectURL(mediaSource)
-
-  let sourceOpen = false
-  let pendingCodec = null
   let pendingPackets = []
 
-  mediaSource.addEventListener('sourceopen', () => {
-    sourceOpen = true
-    if (pendingCodec) createSourceBuffer(pendingCodec)
-  })
+  function initMse(codecStr) {
+    cleanupMse()
+    pendingPackets = []
 
-  function createSourceBuffer(codecStr) {
-    if (sourceBuffer) return
-    const mimeType = `video/mp4; codecs="${codecStr}"`
-    if (!MSrc.isTypeSupported(mimeType)) {
-      streamError.value = 'Браузер не поддерживает кодек: ' + codecStr
-      stopStream()
-      return
-    }
-    sourceBuffer = mediaSource.addSourceBuffer(mimeType)
-    sourceBuffer.mode = 'segments'
-    mediaSource.duration = Infinity
-    sourceBuffer.addEventListener('updateend', onUpdateEnd)
-    sourceBuffer.addEventListener('error', () => {
-      streamError.value = 'Ошибка декодирования видео'
+    mediaSource = new MSrc()
+    video.src = URL.createObjectURL(mediaSource)
+
+    mediaSource.addEventListener('sourceopen', () => {
+      if (!mediaSource || mediaSource.readyState !== 'open') return
+      const mimeType = `video/mp4; codecs="${codecStr}"`
+      if (!MSrc.isTypeSupported(mimeType)) {
+        streamError.value = 'Браузер не поддерживает кодек: ' + codecStr
+        stopStream()
+        return
+      }
+      sourceBuffer = mediaSource.addSourceBuffer(mimeType)
+      sourceBuffer.mode = 'segments'
+      mediaSource.duration = Infinity
+      sourceBuffer.addEventListener('updateend', onUpdateEnd)
+      sourceBuffer.addEventListener('error', () => {
+        streamError.value = 'Ошибка декодирования видео'
+      })
+      if (pendingPackets.length > 0) {
+        for (const pkt of pendingPackets) pushPacket(pkt)
+        pendingPackets = []
+        if (video.paused) video.play().catch(() => {})
+      }
     })
-    if (pendingPackets.length > 0) {
-      for (const pkt of pendingPackets) pushPacket(pkt)
-      pendingPackets = []
-      if (video.paused) video.play().catch(() => {})
-    }
   }
 
   ws = new WebSocket(wsUrl)
@@ -245,6 +243,12 @@ function connectToStream(wsUrl) {
           streamStatus.value = 'Ожидание видеоданных...'
           reconnectCount = 0
         }
+        if (msg.status === 'connecting') {
+          streamStatus.value = 'Подключение к камере...'
+        }
+        if (msg.status === 'reconnecting') {
+          streamStatus.value = 'Камера переподключается...'
+        }
       } catch {}
       return
     }
@@ -252,8 +256,8 @@ function connectToStream(wsUrl) {
     const data = new Uint8Array(event.data)
     if (data[0] === 6) {
       const codecStr = new TextDecoder().decode(data.slice(1))
-      if (sourceOpen) createSourceBuffer(codecStr)
-      else pendingCodec = codecStr
+      streamStatus.value = ''
+      initMse(codecStr)
       return
     }
 
