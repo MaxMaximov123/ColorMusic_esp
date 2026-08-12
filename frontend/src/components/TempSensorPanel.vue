@@ -255,8 +255,25 @@ onUnmounted(() => {
 .notify-row { display: flex; align-items: center; justify-content: space-between; }
 .notify-label { font-size: 0.9rem; color: #ccc; }
 
-.chart-container { position: relative; height: 250px; min-height: 200px; }
+.chart-container { position: relative; height: 200px; min-height: 180px; }
 .chart-loading { opacity: 0.5; }
+
+@media (min-width: 400px) {
+  .chart-container { height: 250px; }
+}
+
+@media (min-width: 768px) {
+  .chart-container { height: 300px; }
+}
+
+@media (max-width: 359px) {
+  .temp-value { font-size: 3rem; }
+  .temp-unit { font-size: 1.5rem; }
+}
+
+@media (min-width: 768px) {
+  .threshold-row { gap: 16px; }
+}
 </style>
 
 <!-- Unscoped — Teleport renders outside component scope -->

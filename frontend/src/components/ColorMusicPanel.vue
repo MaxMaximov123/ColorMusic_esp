@@ -605,13 +605,26 @@ function doCalibrate() {
 
 .mode-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 6px;
 }
 
+@media (min-width: 400px) {
+  .mode-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
 .mode-btn {
-  font-size: 0.75rem !important;
+  font-size: 0.7rem !important;
   border: 2px solid transparent !important;
+  min-height: 36px;
+}
+
+@media (min-width: 400px) {
+  .mode-btn {
+    font-size: 0.75rem !important;
+  }
 }
 
 .mode-active {
@@ -644,15 +657,30 @@ function doCalibrate() {
 
 .slider-row {
   display: grid;
-  grid-template-columns: 100px 1fr 50px;
+  grid-template-columns: 80px 1fr 42px;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
+}
+
+@media (min-width: 400px) {
+  .slider-row {
+    grid-template-columns: 100px 1fr 50px;
+    gap: 10px;
+  }
 }
 
 .slider-label {
-  font-size: 0.82rem;
+  font-size: 0.75rem;
   color: #aaa;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (min-width: 400px) {
+  .slider-label {
+    font-size: 0.82rem;
+  }
 }
 
 .slider-value {

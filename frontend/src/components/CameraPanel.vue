@@ -89,6 +89,7 @@ const viewportCursor = computed(() => {
 function onFullscreenChange() {
   if (!document.fullscreenElement && !document.webkitFullscreenElement) {
     isFullscreen.value = false
+    document.body.style.overflow = ''
   }
 }
 
@@ -592,6 +593,7 @@ function onDblClick(e) {
 function toggleFullscreen() {
   if (isFullscreen.value) {
     isFullscreen.value = false
+    document.body.style.overflow = ''
     try {
       if (document.fullscreenElement) document.exitFullscreen()
       else if (document.webkitFullscreenElement) document.webkitExitFullscreen()
@@ -602,7 +604,11 @@ function toggleFullscreen() {
     if (!el) return
     isFullscreen.value = true
     const fn = el.requestFullscreen || el.webkitRequestFullscreen
-    if (fn) fn.call(el)
+    if (fn) {
+      fn.call(el)
+    } else {
+      document.body.style.overflow = 'hidden'
+    }
     try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
   }
 }
@@ -649,6 +655,7 @@ function doIpeyeLogout() {
       <q-card v-else dark class="section-card camera-card">
         <q-card-section class="q-pa-none">
           <div ref="viewportRef" class="video-viewport"
+               :class="{ 'video-viewport--fs-css': isFullscreen }"
                :style="{ cursor: viewportCursor }"
                @touchstart="onTouchStart"
                @touchmove="onTouchMove"
@@ -872,7 +879,7 @@ function doIpeyeLogout() {
   z-index: 5;
 }
 
-/* --- Fullscreen --- */
+/* --- Fullscreen (native API) --- */
 .video-viewport:fullscreen,
 .video-viewport:-webkit-full-screen {
   background: #000;
@@ -888,5 +895,41 @@ function doIpeyeLogout() {
 .video-viewport:-webkit-full-screen .video-el {
   max-width: 100%; max-height: 100%;
   width: auto; height: auto;
+}
+
+/* --- Fullscreen CSS fallback (iOS Safari) --- */
+.video-viewport--fs-css:not(:fullscreen):not(:-webkit-full-screen) {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  border-radius: 0;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
+           env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
+}
+.video-viewport--fs-css:not(:fullscreen):not(:-webkit-full-screen) .video-track {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; height: 100%;
+}
+.video-viewport--fs-css:not(:fullscreen):not(:-webkit-full-screen) .video-el {
+  max-width: 100%; max-height: 100%;
+  width: auto; height: auto;
+}
+
+/* --- Responsive controls --- */
+@media (min-width: 768px) {
+  .ctrl-btn { width: 38px; height: 38px; }
+  .ctrl-btn .material-icons { font-size: 22px; }
+  .ctrl-name { font-size: 0.9rem; }
+}
+
+@media (max-width: 359px) {
+  .ctrl-btn { width: 30px; height: 30px; }
+  .ctrl-btn .material-icons { font-size: 18px; }
+  .ctrl-name { font-size: 0.78rem; }
+  .ctrl-top { padding: 6px 4px 18px; }
 }
 </style>

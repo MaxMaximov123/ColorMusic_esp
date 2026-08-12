@@ -1,11 +1,12 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, defineAsyncComponent } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuth } from '../composables/useAuth.js'
 import { useWebSocket } from '../composables/useWebSocket.js'
-import ColorMusicPanel from '../components/ColorMusicPanel.vue'
-import TempSensorPanel from '../components/TempSensorPanel.vue'
-import CameraPanel from '../components/CameraPanel.vue'
+
+const ColorMusicPanel = defineAsyncComponent(() => import('../components/ColorMusicPanel.vue'))
+const TempSensorPanel = defineAsyncComponent(() => import('../components/TempSensorPanel.vue'))
+const CameraPanel = defineAsyncComponent(() => import('../components/CameraPanel.vue'))
 
 const router = useRouter()
 const { logout } = useAuth()
@@ -32,21 +33,21 @@ function doLogout() {
 
 <template>
   <q-layout view="hHh lpr fFf">
-    <q-header class="bg-dark">
-      <q-toolbar>
-        <q-toolbar-title style="color: #2ee8b7; font-weight: 700;">
+    <q-header class="bg-dark header-safe">
+      <q-toolbar class="toolbar-compact">
+        <q-toolbar-title class="app-title">
           Smart Home
         </q-toolbar-title>
 
-        <div class="status-indicator q-mr-md">
+        <div class="status-indicator">
           <span
             class="status-dot"
             :style="{ background: connected ? '#4caf50' : '#f44336', boxShadow: connected ? '0 0 6px #4caf50' : '0 0 6px #f44336' }"
           ></span>
-          <span class="status-text">{{ connected ? 'Подключено' : 'Нет связи' }}</span>
+          <span class="status-text hide-xs">{{ connected ? 'Подключено' : 'Нет связи' }}</span>
         </div>
 
-        <q-btn flat icon="logout" @click="doLogout" color="grey-5" />
+        <q-btn flat icon="logout" @click="doLogout" color="grey-5" size="sm" padding="xs" />
       </q-toolbar>
 
       <q-tabs
@@ -55,7 +56,8 @@ function doLogout() {
         active-color="primary"
         indicator-color="primary"
         narrow-indicator
-        class="bg-dark"
+        class="bg-dark tabs-compact"
+        dense
       >
         <q-tab
           v-for="dev in devices"
@@ -76,11 +78,12 @@ function doLogout() {
     </q-header>
 
     <q-page-container>
-      <q-page class="q-pa-md" style="max-width: 600px; margin: 0 auto;">
+      <q-page class="page-content">
         <q-tab-panels
           v-model="selectedTab"
           animated
           class="bg-transparent"
+          keep-alive-exclude="CameraPanel"
         >
           <q-tab-panel
             v-for="dev in devices"
@@ -115,10 +118,32 @@ function doLogout() {
 </template>
 
 <style scoped>
+.header-safe {
+  padding-top: env(safe-area-inset-top, 0);
+  padding-left: env(safe-area-inset-left, 0);
+  padding-right: env(safe-area-inset-right, 0);
+}
+
+.toolbar-compact {
+  min-height: 44px;
+  padding: 0 8px;
+}
+
+.app-title {
+  color: #2ee8b7;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.tabs-compact {
+  min-height: 36px;
+}
+
 .status-indicator {
   display: flex;
   align-items: center;
   gap: 6px;
+  margin-right: 8px;
 }
 
 .status-dot {
@@ -126,10 +151,11 @@ function doLogout() {
   height: 8px;
   border-radius: 50%;
   display: inline-block;
+  flex-shrink: 0;
 }
 
 .status-text {
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   color: #aaa;
 }
 
@@ -138,5 +164,38 @@ function doLogout() {
   height: 6px;
   border-radius: 50%;
   display: inline-block;
+}
+
+.page-content {
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 8px;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0));
+}
+
+@media (min-width: 768px) {
+  .page-content {
+    max-width: 800px;
+    padding: 16px;
+  }
+  .toolbar-compact {
+    min-height: 48px;
+    padding: 0 12px;
+  }
+  .app-title {
+    font-size: 1.2rem;
+  }
+}
+
+@media (min-width: 1200px) {
+  .page-content {
+    max-width: 960px;
+  }
+}
+
+@media (max-width: 359px) {
+  .hide-xs {
+    display: none;
+  }
 }
 </style>

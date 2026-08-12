@@ -9,7 +9,17 @@ export default defineConfig({
   ],
   build: {
     outDir: '../server/public',
-    emptyOutDir: true
+    emptyOutDir: true,
+    target: 'es2020',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vue-vendor': ['vue', 'vue-router'],
+          'quasar': ['quasar'],
+          'chart': ['chart.js', 'vue-chartjs']
+        }
+      }
+    }
   },
   server: {
     proxy: {
