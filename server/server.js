@@ -197,11 +197,8 @@ class RtspStream {
     this.codec = null;
 
     const args = [
-      '-hide_banner', '-nostats', '-loglevel', 'error',
-      '-fflags', 'nobuffer',
-      '-flags', 'low_delay',
+      '-hide_banner', '-nostats', '-loglevel', 'warning',
       '-rtsp_transport', 'tcp',
-      '-rw_timeout', '5000000',
       '-i', this.camera.url,
       '-c:v', 'copy', '-an',
       '-f', 'mp4',
@@ -275,7 +272,7 @@ class RtspStream {
         console.log(`[rtsp] ${this.camera.id} ffmpeg failed to connect (code ${code}), attempt ${this.restartCount}`);
       }
 
-      if (this.restartCount >= 30) {
+      if (this.restartCount >= 100) {
         console.error(`[rtsp] ${this.camera.id} giving up after ${this.restartCount} failures`);
         for (const ws of this.clients) {
           if (ws.readyState === 1) {
