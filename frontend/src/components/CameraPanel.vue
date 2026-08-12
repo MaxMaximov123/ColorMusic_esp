@@ -15,6 +15,7 @@ const loginError = ref('')
 const streamStatus = ref('')
 const streamError = ref('')
 const isFullscreen = ref(false)
+const fsFallback = ref(false)
 const autoConnecting = ref(true)
 const cameraMode = ref(null) // 'rtsp' | 'ipeye'
 
@@ -89,6 +90,7 @@ const viewportCursor = computed(() => {
 function onFullscreenChange() {
   if (!document.fullscreenElement && !document.webkitFullscreenElement) {
     isFullscreen.value = false
+    fsFallback.value = false
     document.body.style.overflow = ''
   }
 }
@@ -593,6 +595,7 @@ function onDblClick(e) {
 function toggleFullscreen() {
   if (isFullscreen.value) {
     isFullscreen.value = false
+    fsFallback.value = false
     document.body.style.overflow = ''
     try {
       if (document.fullscreenElement) document.exitFullscreen()
@@ -605,8 +608,12 @@ function toggleFullscreen() {
     isFullscreen.value = true
     const fn = el.requestFullscreen || el.webkitRequestFullscreen
     if (fn) {
-      fn.call(el)
+      try {
+        const p = fn.call(el)
+        if (p && p.catch) p.catch(() => { fsFallback.value = true; document.body.style.overflow = 'hidden' })
+      } catch { fsFallback.value = true; document.body.style.overflow = 'hidden' }
     } else {
+      fsFallback.value = true
       document.body.style.overflow = 'hidden'
     }
     try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
@@ -655,7 +662,7 @@ function doIpeyeLogout() {
       <q-card v-else dark class="section-card camera-card">
         <q-card-section class="q-pa-none">
           <div ref="viewportRef" class="video-viewport"
-               :class="{ 'video-viewport--fs-css': isFullscreen }"
+               :class="{ 'vp-fs-fallback': fsFallback }"
                :style="{ cursor: viewportCursor }"
                @touchstart="onTouchStart"
                @touchmove="onTouchMove"
@@ -899,30 +906,39 @@ function doIpeyeLogout() {
   z-index: 5;
 }
 
-/* --- Fullscreen (native API) --- */
-.video-viewport:fullscreen,
+/* --- Fullscreen (native API) — separate rules so vendor prefix doesn't invalidate the other --- */
+.video-viewport:fullscreen {
+  background: #000;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 0;
+}
+.video-viewport:fullscreen .video-track {
+  width: 100%; height: 100%;
+}
+.video-viewport:fullscreen .video-el {
+  width: 100%; height: 100%;
+  object-fit: contain;
+}
+
 .video-viewport:-webkit-full-screen {
   background: #000;
   display: flex; align-items: center; justify-content: center;
   border-radius: 0;
 }
-.video-viewport:fullscreen .video-track,
 .video-viewport:-webkit-full-screen .video-track {
-  display: flex; align-items: center; justify-content: center;
   width: 100%; height: 100%;
 }
-.video-viewport:fullscreen .video-el,
 .video-viewport:-webkit-full-screen .video-el {
-  max-width: 100%; max-height: 100%;
-  width: auto; height: auto;
+  width: 100%; height: 100%;
+  object-fit: contain;
 }
 
-/* --- Fullscreen CSS fallback (iOS Safari) --- */
-.video-viewport--fs-css:not(:fullscreen):not(:-webkit-full-screen) {
-  position: fixed;
+/* --- Fullscreen CSS fallback (iOS Safari / browsers without Fullscreen API on div) --- */
+.vp-fs-fallback {
+  position: fixed !important;
   inset: 0;
   z-index: 99999;
-  border-radius: 0;
+  border-radius: 0 !important;
   min-height: 100dvh;
   display: flex;
   align-items: center;
@@ -930,13 +946,13 @@ function doIpeyeLogout() {
   padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
            env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
 }
-.video-viewport--fs-css:not(:fullscreen):not(:-webkit-full-screen) .video-track {
-  display: flex; align-items: center; justify-content: center;
+.vp-fs-fallback .video-track {
   width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
 }
-.video-viewport--fs-css:not(:fullscreen):not(:-webkit-full-screen) .video-el {
-  max-width: 100%; max-height: 100%;
-  width: auto; height: auto;
+.vp-fs-fallback .video-el {
+  width: 100%; height: 100%;
+  object-fit: contain;
 }
 
 /* --- Responsive controls --- */

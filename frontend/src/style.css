@@ -1,3 +1,13 @@
+html {
+  -webkit-text-size-adjust: 100%;
+  -ms-text-size-adjust: 100%;
+}
+
+html, body {
+  touch-action: manipulation;
+  overscroll-behavior: none;
+}
+
 body {
-  background: #111;
+  background: #070b14;
 }
