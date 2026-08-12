@@ -199,6 +199,12 @@ function connectToStream(wsUrl) {
   if (!video) return
 
   const MSrc = window.ManagedMediaSource || window.MediaSource
+  if (!MSrc) {
+    streamError.value = 'Браузер не поддерживает видеотрансляцию'
+    streaming.value = false
+    return
+  }
+
   let pendingPackets = []
 
   function initMse(codecStr) {
@@ -206,6 +212,7 @@ function connectToStream(wsUrl) {
     pendingPackets = []
 
     mediaSource = new MSrc()
+    video.disableRemotePlayback = true
     video.src = URL.createObjectURL(mediaSource)
 
     mediaSource.addEventListener('sourceopen', () => {
@@ -218,7 +225,7 @@ function connectToStream(wsUrl) {
       }
       sourceBuffer = mediaSource.addSourceBuffer(mimeType)
       sourceBuffer.mode = 'segments'
-      mediaSource.duration = Infinity
+      try { mediaSource.duration = Infinity } catch {}
       sourceBuffer.addEventListener('updateend', onUpdateEnd)
       sourceBuffer.addEventListener('error', () => {
         streamError.value = 'Ошибка декодирования видео'
@@ -654,7 +661,7 @@ function doIpeyeLogout() {
                @mouseleave="onMouseUp">
 
             <div class="video-track" :style="{ transform: `translateX(${swipeOffset}px)` }">
-              <video ref="videoRef" autoplay muted playsinline
+              <video ref="videoRef" autoplay muted playsinline disableRemotePlayback
                      class="video-el" :style="zoomStyle" />
             </div>
 
