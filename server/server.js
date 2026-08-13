@@ -338,6 +338,13 @@ class RtspStream {
   _accumulateAndBroadcast(chunk) {
     this.fragBuf = Buffer.concat([this.fragBuf, chunk]);
 
+    if (this.fragBuf.length > 4 * 1024 * 1024) {
+      console.warn(`[rtsp] ${this.camera.id}: fragBuf overflow (${this.fragBuf.length}b), resetting`);
+      this.fragBuf = Buffer.alloc(0);
+      this.pendingMoof = null;
+      return;
+    }
+
     while (this.fragBuf.length >= 8) {
       const boxSize = this.fragBuf.readUInt32BE(0);
       if (boxSize < 8 || boxSize > 50 * 1024 * 1024) {
@@ -412,6 +419,30 @@ class RtspStream {
       this.ffmpeg = null;
     }
   }
+
+  restart() {
+    return new Promise((resolve) => {
+      this.stop();
+      this.stopped = false;
+      this.restartDelay = 1000;
+
+      for (const ws of this.clients) {
+        if (ws.readyState === 1) {
+          ws._rtspInitSent = false;
+          ws.send(JSON.stringify({ status: 'reconnecting' }));
+        }
+      }
+
+      const origStart = this.start.bind(this);
+      const checkReady = () => {
+        if (this.ready) { resolve(); return; }
+        setTimeout(checkReady, 500);
+      };
+
+      setTimeout(() => { origStart(); checkReady(); }, 300);
+      setTimeout(() => resolve(), 60000);
+    });
+  }
 }
 
 const rtspStreams = new Map();
@@ -431,6 +462,35 @@ app.get('/api/cameras', authMiddleware, (req, res) => {
     const s = rtspStreams.get(c.id);
     return { id: c.id, name: c.name, online: !!s?.ffmpeg, ready: !!s?.ready };
   }));
+});
+
+app.post('/api/cameras/restart', authMiddleware, async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const ids = [...rtspStreams.keys()];
+  const total = ids.length;
+  let done = 0;
+
+  const send = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
+
+  send({ event: 'start', total });
+
+  for (const id of ids) {
+    const stream = rtspStreams.get(id);
+    if (!stream) { done++; continue; }
+    const cam = stream.camera;
+    send({ event: 'restarting', id, name: cam.name, done, total });
+    console.log(`[rtsp] restart: ${id} (${done + 1}/${total})`);
+    await stream.restart();
+    done++;
+    send({ event: 'connected', id, name: cam.name, done, total });
+  }
+
+  send({ event: 'done', total: done });
+  res.end();
 });
 
 // ── IPeye Client ──

@@ -646,6 +646,61 @@ function toggleFullscreen() {
   try { screen.orientation.lock('landscape').catch(() => {}) } catch {}
 }
 
+// --- Restart streams ---
+const showRestartConfirm = ref(false)
+const restarting = ref(false)
+const restartTotal = ref(0)
+const restartDone = ref(0)
+const restartCurrent = ref('')
+
+async function doRestartStreams() {
+  showRestartConfirm.value = false
+  restarting.value = true
+  restartDone.value = 0
+  restartTotal.value = cameras.value.length
+  restartCurrent.value = ''
+
+  try {
+    const resp = await fetch('/api/cameras/restart', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${getToken()}` }
+    })
+
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      const lines = buffer.split('\n')
+      buffer = lines.pop()
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const msg = JSON.parse(line.slice(6))
+          if (msg.event === 'start') restartTotal.value = msg.total
+          if (msg.event === 'restarting') restartCurrent.value = msg.name || msg.id
+          if (msg.event === 'connected') { restartDone.value = msg.done; restartCurrent.value = '' }
+          if (msg.event === 'done') { restartDone.value = msg.total; break }
+        } catch {}
+      }
+    }
+  } catch (e) {
+    console.error('Restart failed:', e)
+  }
+
+  restarting.value = false
+  if (selectedCamera.value) {
+    stopStream()
+    await nextTick()
+    startStream()
+  }
+}
+
 function doIpeyeLogout() {
   stopStream()
   ipeyeSession.value = null
@@ -759,8 +814,49 @@ function doIpeyeLogout() {
           <span class="cam-thumb-name">{{ cam.name || cam.id }}</span>
         </button>
       </div>
+
+      <!-- Restart button -->
+      <button v-if="cameraMode === 'rtsp'" class="restart-btn glass" @click="showRestartConfirm = true">
+        <span class="material-icons">refresh</span>
+        <span>Перезапустить камеры</span>
+      </button>
     </template>
 
+    <!-- Restart confirmation dialog -->
+    <Teleport to="body">
+      <div v-if="showRestartConfirm" class="modal-overlay" @click.self="showRestartConfirm = false">
+        <div class="modal-card glass">
+          <div class="modal-title">Перезапустить камеры?</div>
+          <p class="modal-text">Все RTSP потоки будут переподключены. Видео временно будет недоступно.</p>
+          <div class="modal-actions">
+            <button class="modal-btn modal-btn--cancel" @click="showRestartConfirm = false">Отмена</button>
+            <button class="modal-btn modal-btn--confirm" @click="doRestartStreams">Перезапустить</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Restart progress overlay -->
+    <Teleport to="body">
+      <div v-if="restarting" class="modal-overlay">
+        <div class="modal-card glass" style="text-align:center;">
+          <div class="modal-title">Переподключение камер</div>
+          <div class="restart-progress">
+            <div class="restart-bar">
+              <div class="restart-bar-fill" :style="{ width: restartTotal ? (restartDone / restartTotal * 100) + '%' : '0%' }"></div>
+            </div>
+            <div class="restart-status">
+              <span class="restart-count">{{ restartDone }} / {{ restartTotal }}</span>
+              <span v-if="restartCurrent" class="restart-current">{{ restartCurrent }}...</span>
+            </div>
+          </div>
+          <q-spinner v-if="restartDone < restartTotal" color="primary" size="1.5em" class="q-mt-md" />
+          <div v-else class="q-mt-md" style="color:#2ee8b7;">
+            <span class="material-icons">check_circle</span>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -1031,6 +1127,124 @@ function doIpeyeLogout() {
 
 @media (min-width: 768px) {
   .cam-grid { grid-template-columns: repeat(3, 1fr); gap: 12px; }
+}
+
+/* --- Restart button --- */
+.restart-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  color: #aaa;
+  font-size: 0.85rem;
+  transition: color 0.2s, background 0.2s;
+}
+.restart-btn:active { background: rgba(255, 255, 255, 0.08); }
+.restart-btn .material-icons { font-size: 20px; }
+
+@media (hover: hover) {
+  .restart-btn:hover { color: #2ee8b7; background: rgba(46, 232, 183, 0.06); }
+}
+
+/* --- Modal --- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 360px;
+  padding: 24px;
+}
+
+.modal-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #eee;
+  margin-bottom: 8px;
+}
+
+.modal-text {
+  font-size: 0.85rem;
+  color: #888;
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.modal-btn {
+  padding: 8px 20px;
+  border-radius: 10px;
+  border: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.modal-btn--cancel {
+  background: rgba(255, 255, 255, 0.08);
+  color: #aaa;
+}
+.modal-btn--cancel:active { background: rgba(255, 255, 255, 0.15); }
+
+.modal-btn--confirm {
+  background: #2ee8b7;
+  color: #0a0e1a;
+}
+.modal-btn--confirm:active { background: #26c99e; }
+
+/* --- Restart progress --- */
+.restart-progress {
+  margin-top: 16px;
+}
+
+.restart-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.restart-bar-fill {
+  height: 100%;
+  background: #2ee8b7;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.restart-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 0.82rem;
+}
+
+.restart-count {
+  color: #2ee8b7;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.restart-current {
+  color: #666;
 }
 </style>
 
