@@ -12,7 +12,7 @@ const { spawn } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
-const JWT_EXPIRES = '24h';
+const JWT_EXPIRES = '30d';
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin';
 
